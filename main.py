@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.0"
+SCRAPER_VERSION = "v12.1"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -625,15 +625,34 @@ def extract_calendar_data(driver: webdriver.Chrome) -> Dict[str, Any]:
 
     try:
         for ms in month_shifts:
-            logger.info(f"Loading calendar view: month_shift={ms}, today={today}, date_shift={date_shift}")
-            rendered_count = _load_calendar_view(driver, month_shift=ms, today=today, date_shift=date_shift)
+            # IMPORTANT:
+            # If `today=1`, OTELMS tends to force the calendar to the current date/month,
+            # which can effectively ignore `month_shift`. Only use `today=1` for the "current"
+            # view (month_shift=0) when no explicit date_shift is provided.
+            effective_today = bool(today and ms == 0 and date_shift == "0")
+
+            logger.info(
+                f"Loading calendar view: month_shift={ms}, today={effective_today}, date_shift={date_shift}"
+            )
+            rendered_count = _load_calendar_view(
+                driver,
+                month_shift=ms,
+                today=effective_today,
+                date_shift=date_shift,
+            )
             logger.info(f"Rendered {rendered_count} booking nodes in view month_shift={ms}")
 
             if _debug_artifacts_enabled():
                 save_debug_artifacts(driver, f'calendar_view_ms_{ms}', extra=collect_calendar_diagnostics(driver))
 
             raw_items = scan_calendar_items(driver, max_scan_seconds=scan_seconds)
-            views_scanned.append({"month_shift": ms, "rendered_count": rendered_count, "scanned_count": len(raw_items)})
+            views_scanned.append({
+                "month_shift": ms,
+                "today": effective_today,
+                "date_shift": date_shift,
+                "rendered_count": rendered_count,
+                "scanned_count": len(raw_items),
+            })
             logger.info(f"Scanned {len(raw_items)} unique items in this view (month_shift={ms})")
 
             for item in raw_items:
