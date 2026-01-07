@@ -11,7 +11,7 @@ import time
 import logging
 import requests
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from flask import Flask, jsonify
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -32,6 +32,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# Scraper version
+SCRAPER_VERSION = "v11.6"
 
 # Validate required environment variables
 REQUIRED_ENV_VARS = ['OTELMS_USERNAME', 'OTELMS_PASSWORD', 'GCS_BUCKET']
@@ -62,8 +65,18 @@ def setup_driver() -> webdriver.Chrome:
     chrome_options.add_argument('--no-sandbox')
     chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument('--window-size=1920,3000')
     chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    # Reduce timer throttling / background rendering issues in headless containers
+    chrome_options.add_argument('--disable-background-timer-throttling')
+    chrome_options.add_argument('--disable-backgrounding-occluded-windows')
+    chrome_options.add_argument('--disable-renderer-backgrounding')
+    chrome_options.add_argument('--no-first-run')
+    chrome_options.add_argument('--no-default-browser-check')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-popup-blocking')
+    chrome_options.add_argument('--hide-scrollbars')
+    chrome_options.add_argument('--mute-audio')
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -71,9 +84,41 @@ def setup_driver() -> webdriver.Chrome:
     
     driver = webdriver.Chrome(options=chrome_options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    # Block known third-party widgets that can slow down/hang page load
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
+            "https://otelmschat.otelms.com/*",
+            "https://use.fontawesome.com/*",
+        ]})
+    except Exception as e:
+        logger.debug(f"CDP network blocking unavailable: {e}")
+
     return driver
 
-def save_debug_artifacts(driver: webdriver.Chrome, name: str) -> Optional[str]:
+def _safe_execute(driver: webdriver.Chrome, script: str, default: Any = None) -> Any:
+    try:
+        return driver.execute_script(script)
+    except Exception:
+        return default
+
+def collect_calendar_diagnostics(driver: webdriver.Chrome) -> Dict[str, Any]:
+    """Collect high-signal diagnostics to understand render failures."""
+    return {
+        "url": getattr(driver, "current_url", ""),
+        "readyState": _safe_execute(driver, "return document.readyState", ""),
+        "hasJQuery": bool(_safe_execute(driver, "return typeof window.jQuery !== 'undefined'", False)),
+        "jQueryActive": _safe_execute(driver, "return (window.jQuery && window.jQuery.active) || null", None),
+        "calendarTdCount": _safe_execute(driver, "return document.querySelectorAll('td.calendar_td').length", 0),
+        "calendarItemCount": _safe_execute(driver, "return document.querySelectorAll('div.calendar_item').length", 0),
+        "calendarItemResidCount": _safe_execute(driver, "return document.querySelectorAll('div.calendar_item[resid]').length", 0),
+        "calendarContainerPresent": bool(_safe_execute(driver, "return !!document.querySelector('.calendar_container')", False)),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": SCRAPER_VERSION,
+    }
+
+def save_debug_artifacts(driver: webdriver.Chrome, name: str, extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Save screenshot and page source to GCS for debugging"""
     try:
         timestamp = int(time.time())
@@ -94,6 +139,13 @@ def save_debug_artifacts(driver: webdriver.Chrome, name: str) -> Optional[str]:
         source_blob = bucket.blob(f'debug/{name}_{timestamp}.html')
         source_blob.upload_from_string(page_source, content_type='text/html')
         
+        if extra is not None:
+            extra_blob = bucket.blob(f'debug/{name}_{timestamp}.json')
+            extra_blob.upload_from_string(
+                json.dumps(extra, ensure_ascii=False, indent=2),
+                content_type='application/json'
+            )
+
         logger.info(f"Debug artifacts saved: {name}_{timestamp}")
         return f"gs://{GCS_BUCKET}/debug/{name}_{timestamp}"
         
@@ -184,144 +236,177 @@ def login_to_otelms(driver: webdriver.Chrome) -> None:
         save_debug_artifacts(driver, 'login_error')
         raise Exception(f"Login failed: {e}")
 
+def _kick_calendar_render(driver: webdriver.Chrome) -> None:
+    """
+    OTELMS calendar scrolling is usually inside `.calendar_container` (not window).
+    We scroll both the container and window to trigger any lazy rendering/handlers.
+    """
+    driver.execute_script(
+        """
+        const el = document.querySelector('.calendar_container');
+        if (el) {
+          // Vertical
+          el.scrollTop = el.scrollHeight;
+          el.dispatchEvent(new Event('scroll', {bubbles: true}));
+          // Horizontal (some calendars virtualize columns)
+          el.scrollLeft = el.scrollWidth;
+          el.dispatchEvent(new Event('scroll', {bubbles: true}));
+          el.scrollTop = 0;
+          el.scrollLeft = 0;
+          el.dispatchEvent(new Event('scroll', {bubbles: true}));
+        }
+        window.scrollTo(0, document.body.scrollHeight);
+        window.scrollTo(0, 0);
+        """
+    )
+
+def ensure_calendar_rendered(driver: webdriver.Chrome, timeout_seconds: int = 120) -> int:
+    """
+    Wait until bookings are actually rendered into the DOM.
+
+    Strategy:
+    - Wait for calendar grid/container to exist.
+    - "Kick" render via search form submit if available.
+    - Poll for `div.calendar_item[resid]` count > 0 and stable.
+    - Use jQuery activity (when present) as an additional signal.
+    """
+    wait = WebDriverWait(driver, min(timeout_seconds, 30))
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+
+    # Calendar grid (server-rendered) tends to exist before bookings.
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "td.calendar_td, .calendar_container")))
+    except TimeoutException:
+        # Still allow the polling loop to run; diagnostics will show what's missing.
+        pass
+
+    # If a search button exists, submit once to force server-side calendar render.
+    try:
+        search_btn = driver.find_element(By.ID, "search_form_submit")
+        driver.execute_script("arguments[0].click();", search_btn)
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    stable_hits = 0
+    last_count = -1
+    start = time.time()
+
+    while time.time() - start < timeout_seconds:
+        # Actively trigger scroll handlers / lazy rendering during the wait.
+        try:
+            _kick_calendar_render(driver)
+        except Exception:
+            pass
+
+        count = _safe_execute(driver, "return document.querySelectorAll('div.calendar_item[resid]').length", 0)
+        ajax_active = _safe_execute(driver, "return (window.jQuery && window.jQuery.active) || 0", 0)
+
+        # We want "some bookings" and "count not changing" for a couple cycles.
+        if isinstance(count, int) and count > 0:
+            if count == last_count:
+                stable_hits += 1
+            else:
+                stable_hits = 0
+            last_count = count
+            # If jQuery is present but background XHR keeps happening, don't block forever.
+            if stable_hits >= 2 and (ajax_active == 0 or (time.time() - start) > 10):
+                return count
+
+        time.sleep(1.5)
+
+    raise TimeoutException(f"Timed out after {timeout_seconds}s waiting for calendar bookings to render")
+
 def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
     """Extract calendar data with correct HTML structure parsing"""
     logger.info("Loading calendar page...")
     driver.get(OTELMS_CALENDAR_URL)
     
-    wait = WebDriverWait(driver, 60)  # Increased from 20 to 60 seconds
-    
     try:
-        # Wait for calendar to load
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.calendar_item')))
-        logger.info("Calendar loaded successfully")
-        
-        # Wait for dynamic content
-        WebDriverWait(driver, 10).until(
-            lambda d: d.execute_script('return document.readyState') == 'complete'
-        )
-        time.sleep(2)
-        
-        # Scroll down to trigger lazy loading
-        logger.info("Scrolling to trigger lazy loading...")
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(3)
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(2)
-        
-        # Wait explicitly for calendar_item elements with resid attribute
-        logger.info("Waiting for calendar items with resid attribute...")
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'div.calendar_item[resid]'))
-        )
-        logger.info("Calendar items with resid found!")
-        time.sleep(2)
-        
-        save_debug_artifacts(driver, 'calendar_loaded')
+        # If we got redirected back to login, re-auth and reload calendar.
+        if "login" in (driver.current_url or "").lower():
+            logger.warning("Calendar URL redirected to login; re-authenticating...")
+            login_to_otelms(driver)
+            driver.get(OTELMS_CALENDAR_URL)
+
+        # Wait for actual rendered bookings (not just page load).
+        render_timeout = int(os.environ.get("CALENDAR_RENDER_TIMEOUT", "120"))
+        logger.info(f"Waiting for calendar bookings to render (timeout={render_timeout}s)...")
+        rendered_count = ensure_calendar_rendered(driver, timeout_seconds=render_timeout)
+        logger.info(f"Calendar bookings rendered: {rendered_count} elements with resid")
+
+        save_debug_artifacts(driver, 'calendar_rendered', extra=collect_calendar_diagnostics(driver))
         
         # Extract booking blocks
         data_rows = []
         seen_bookings = set()
-        
-        max_attempts = 3
-        for attempt in range(max_attempts):
+
+        # Extract via JS to avoid stale element reference issues.
+        raw_items = driver.execute_script(
+            """
+            return Array.from(document.querySelectorAll('div.calendar_item[resid]')).map(el => {
+              const resid = el.getAttribute('resid');
+              const status = el.getAttribute('status') || '';
+              const element_id = el.getAttribute('id') || '';
+              const booking_nam = (el.querySelector('.calendar_booking_nam')?.textContent || '').trim();
+              const booking_info = (el.querySelector('.calendar_booking_info')?.textContent || '').trim();
+              const balance = (el.querySelector('.balance_negative span, .balance_positive span')?.textContent || '').trim();
+              return {resid, status, element_id, booking_nam, booking_info, balance};
+            });
+            """
+        ) or []
+
+        logger.info(f"Found {len(raw_items)} booking blocks (JS extraction)")
+
+        for item in raw_items:
             try:
-                elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item[resid]')
-                logger.info(f"Found {len(elements)} booking blocks (attempt {attempt + 1})")
-                
-                for idx, element in enumerate(elements):
-                    try:
-                        # Re-fetch to avoid stale reference
-                        elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item[resid]')
-                        if idx >= len(elements):
-                            break
-                        element = elements[idx]
-                        
-                        # Extract attributes
-                        resid = element.get_attribute('resid')
-                        status = element.get_attribute('status')
-                        element_id = element.get_attribute('id')
-                        
-                        if not resid:
-                            continue
-                        
-                        # Duplicate detection
-                        if resid in seen_bookings:
-                            continue
-                        seen_bookings.add(resid)
-                        
-                        # Extract nested elements
-                        booking_id = None
-                        guest_name = None
-                        source = None
-                        balance = None
-                        
-                        # Parse calendar_booking_nam: "B:7296,  ჯაბა პაშკოვსკი, "
-                        try:
-                            booking_nam = element.find_element(By.CLASS_NAME, 'calendar_booking_nam').text.strip()
-                            if 'B:' in booking_nam:
-                                # Split by "B:" and then by comma
-                                parts = booking_nam.split('B:')[1].split(',')
-                                if len(parts) >= 2:
-                                    booking_id = parts[0].strip()
-                                    guest_name = parts[1].strip()
-                        except NoSuchElementException:
-                            logger.debug(f"calendar_booking_nam not found for resid {resid}")
-                        except Exception as e:
-                            logger.debug(f"Error parsing booking_nam for resid {resid}: {e}")
-                        
-                        # Parse calendar_booking_info: "whatsapp 577250205, " or "პირდაპირი გაყიდვა, "
-                        try:
-                            source = element.find_element(By.CLASS_NAME, 'calendar_booking_info').text.strip().rstrip(',')
-                        except NoSuchElementException:
-                            logger.debug(f"calendar_booking_info not found for resid {resid}")
-                        
-                        # Parse balance: .balance_negative or .balance_positive span
-                        try:
-                            balance_elem = element.find_element(By.CSS_SELECTOR, '.balance_negative span, .balance_positive span')
-                            balance = balance_elem.text.strip()
-                        except NoSuchElementException:
-                            logger.debug(f"balance not found for resid {resid}")
-                        
-                        # Data validation - at least booking_id or guest_name must exist
-                        if booking_id or guest_name:
-                            data_rows.append({
-                                'resid': resid,
-                                'booking_id': booking_id or resid,  # Fallback to resid
-                                'guest_name': guest_name or '',
-                                'source': source or '',
-                                'balance': balance or '',
-                                'status': status or '',
-                                'element_id': element_id or '',
-                                'extracted_at': datetime.utcnow().isoformat() + 'Z'
-                            })
-                            logger.debug(f"Extracted booking: resid={resid}, booking_id={booking_id}, guest={guest_name}")
-                        else:
-                            logger.warning(f"Skipping resid {resid}: no booking_id or guest_name found")
-                        
-                    except StaleElementReferenceException:
-                        logger.warning(f"Stale element at index {idx}, retrying...")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error parsing element {idx}: {e}")
-                        continue
-                
-                break  # Success, exit retry loop
-                
-            except StaleElementReferenceException:
-                if attempt == max_attempts - 1:
-                    raise
-                logger.warning("Stale elements detected, retrying...")
-                time.sleep(1)
+                resid = (item.get("resid") or "").strip()
+                if not resid or resid in seen_bookings:
+                    continue
+                seen_bookings.add(resid)
+
+                status = (item.get("status") or "").strip()
+                element_id = (item.get("element_id") or "").strip()
+                booking_nam = (item.get("booking_nam") or "").strip()
+                booking_info = (item.get("booking_info") or "").strip().rstrip(",")
+                balance = (item.get("balance") or "").strip()
+
+                booking_id = None
+                guest_name = None
+
+                # Parse calendar_booking_nam: "B:7296,  ჯაბა პაშკოვსკი, "
+                if "B:" in booking_nam:
+                    parts = booking_nam.split("B:", 1)[1].split(",")
+                    if len(parts) >= 2:
+                        booking_id = parts[0].strip()
+                        guest_name = parts[1].strip()
+
+                if booking_id or guest_name:
+                    data_rows.append({
+                        "resid": resid,
+                        "booking_id": booking_id or resid,  # Fallback to resid
+                        "guest_name": guest_name or "",
+                        "source": booking_info,
+                        "balance": balance,
+                        "status": status,
+                        "element_id": element_id,
+                        "extracted_at": datetime.utcnow().isoformat() + "Z",
+                    })
+                else:
+                    logger.warning(f"Skipping resid {resid}: no booking_id or guest_name found")
+            except Exception as e:
+                logger.error(f"Error parsing booking item: {e}")
+                continue
         
         logger.info(f"Extracted {len(data_rows)} unique booking records")
         return data_rows
         
     except TimeoutException:
-        save_debug_artifacts(driver, 'calendar_timeout')
-        raise Exception("Calendar page timeout - booking blocks not found")
+        save_debug_artifacts(driver, 'calendar_timeout', extra=collect_calendar_diagnostics(driver))
+        raise Exception("Calendar render timeout - booking blocks not found")
     except Exception as e:
-        save_debug_artifacts(driver, 'calendar_error')
+        save_debug_artifacts(driver, 'calendar_error', extra=collect_calendar_diagnostics(driver))
         raise Exception(f"Calendar extraction failed: {e}")
 
 def save_to_gcs(data: List[Dict], bucket_name: str) -> str:
@@ -413,7 +498,7 @@ def scrape():
     start_time = time.time()
     
     try:
-        logger.info("=== OTELMS Calendar Scraper v11.4 FINAL Started ===")
+        logger.info(f"=== OTELMS Calendar Scraper {SCRAPER_VERSION} Started ===")
         
         # Setup browser
         driver = setup_driver()
@@ -481,7 +566,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        "version": "v11.5-final",
+        "version": SCRAPER_VERSION,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     }), 200
 
