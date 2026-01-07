@@ -1,7 +1,13 @@
 """
-OTELMS Calendar Scraper v11.5 FINAL - Fixed Timeout + Lazy Loading
+OTELMS Calendar Scraper v12.0
 ==========================================================================
-Bulletproof scraper with correct HTML structure parsing
+Cloud Run hardened calendar scraper.
+
+Key goals:
+- Avoid flaky "JS render" timeouts by waiting on actual booking nodes.
+- Avoid missing bookings due to calendar virtualization by scanning the calendar viewport.
+- Avoid missing bookings due to date window differences by scanning multiple calendar views
+  (month shifts) and de-duplicating by `resid`.
 """
 
 import os
@@ -9,6 +15,8 @@ import sys
 import json
 import time
 import logging
+import re
+import html as _html
 import requests
 from datetime import datetime
 from typing import List, Dict, Optional, Any
@@ -34,7 +42,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v11.7"
+SCRAPER_VERSION = "v12.0"
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
+def _env_int_list(name: str, default: List[int]) -> List[int]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    out: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            continue
+    return out or default
+
+def _debug_artifacts_enabled() -> bool:
+    return _env_bool("DEBUG_ARTIFACTS", False)
 
 # Validate required environment variables
 REQUIRED_ENV_VARS = ['OTELMS_USERNAME', 'OTELMS_PASSWORD', 'GCS_BUCKET']
@@ -260,6 +301,41 @@ def _kick_calendar_render(driver: webdriver.Chrome) -> None:
         """
     )
 
+def _submit_calendar_form(driver: webdriver.Chrome, month_shift: int, today: bool, date_shift: str = "0") -> None:
+    """
+    The calendar is primarily server-rendered on POST to /reservation_c2/calendar
+    using hidden inputs:
+      - month_shift (int)
+      - today (0/1)
+      - date_shift ("0" or "YYYY-MM-DD")
+    """
+    driver.execute_script(
+        """
+        const monthShift = String(arguments[0]);
+        const todayVal = arguments[1] ? "1" : "0";
+        const dateShift = String(arguments[2] || "0");
+
+        const frm = document.getElementById('frmdata');
+        if (!frm) return;
+
+        const ms = document.getElementById('month_shift');
+        const td = document.getElementById('today');
+        const ds = document.getElementById('date_shift');
+        if (ms) ms.value = monthShift;
+        if (td) td.value = todayVal;
+        if (ds) ds.value = dateShift;
+
+        const dateInput = document.getElementById('datein100');
+        if (dateInput && dateShift && dateShift !== "0") {
+          dateInput.value = dateShift;
+        }
+        frm.submit();
+        """,
+        int(month_shift),
+        bool(today),
+        str(date_shift),
+    )
+
 def _get_calendar_container_metrics(driver: webdriver.Chrome) -> Dict[str, int]:
     metrics = driver.execute_script(
         """
@@ -313,6 +389,54 @@ def _collect_calendar_items_js(driver: webdriver.Chrome) -> List[Dict[str, Any]]
         """
     )
     return raw if isinstance(raw, list) else []
+
+def _parse_tooltip_fields(tooltip_html: str) -> Dict[str, str]:
+    """
+    Tooltip is HTML containing structured lines in Georgian, e.g.
+      "შეკვეთა №7296 (ჯავშანი), whatsapp 577250205"
+      "სტუმარი:  ჯაბა პაშკოვსკი"
+      "შემოსვლა: 2025-12-27"
+      "გასვლა: 2026-01-08"
+      "ბალანსი: -500.00, (500.00)"
+    """
+    if not tooltip_html:
+        return {}
+
+    text = _html.unescape(tooltip_html)
+    # Convert common separators to newlines before stripping tags.
+    text = re.sub(r"</div>\s*<div[^>]*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("\r", "")
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    out: Dict[str, str] = {}
+    for ln in lines:
+        if ln.startswith("შეკვეთა №"):
+            m = re.search(r"შეკვეთა №\s*(\d+)", ln)
+            if m:
+                out["booking_id"] = m.group(1)
+            # Everything after comma is usually source/contact
+            parts = [p.strip() for p in ln.split(",") if p.strip()]
+            if len(parts) >= 2:
+                out["source"] = parts[1]
+        elif "სტუმარი:" in ln:
+            out["guest_name"] = ln.split("სტუმარი:", 1)[1].strip()
+        elif ln.startswith("შემოსვლა:"):
+            out["date_in"] = ln.split(":", 1)[1].strip()
+        elif ln.startswith("გასვლა:"):
+            out["date_out"] = ln.split(":", 1)[1].strip()
+        elif "ბალანსი:" in ln:
+            # Take the first numeric value after "ბალანსი:"
+            m = re.search(r"ბალანსი:\s*([+-]?\d+(?:\.\d+)?)", ln)
+            if m:
+                out["balance"] = m.group(1)
+        elif "ტელეფონი:" in ln:
+            out["phone"] = ln.split("ტელეფონი:", 1)[1].strip()
+        elif "პასუხისმგებელი:" in ln:
+            out["responsible"] = ln.split("პასუხისმგებელი:", 1)[1].strip()
+
+    return out
 
 def scan_calendar_items(driver: webdriver.Chrome, max_scan_seconds: int = 60) -> List[Dict[str, Any]]:
     """
@@ -451,78 +575,127 @@ def ensure_calendar_rendered(driver: webdriver.Chrome, calendar_url: str, timeou
 
     raise TimeoutException(f"Timed out after {timeout_seconds}s waiting for calendar bookings to render")
 
-def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
-    """Extract calendar data with correct HTML structure parsing"""
-    logger.info("Loading calendar page...")
+def _load_calendar_view(driver: webdriver.Chrome, month_shift: int, today: bool, date_shift: str) -> int:
+    """Load a specific calendar view by submitting the server-rendered calendar form."""
     driver.get(OTELMS_CALENDAR_URL)
-    
+
+    if "login" in (driver.current_url or "").lower():
+        logger.warning("Calendar URL redirected to login; re-authenticating...")
+        login_to_otelms(driver)
+        driver.get(OTELMS_CALENDAR_URL)
+
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "frmdata")))
+    _submit_calendar_form(driver, month_shift=month_shift, today=today, date_shift=date_shift)
+
+    render_timeout = _env_int("CALENDAR_RENDER_TIMEOUT", 300)
+    rendered_count = ensure_calendar_rendered(driver, OTELMS_CALENDAR_URL, timeout_seconds=render_timeout)
+    return rendered_count
+
+def extract_calendar_data(driver: webdriver.Chrome) -> Dict[str, Any]:
+    """
+    Extract calendar data across one or more calendar views.
+
+    By default v12.0 scans month shifts -1,0,1 to reduce "missing bookings"
+    caused by differing default date windows in headless environments.
+    """
+    month_shifts = _env_int_list("CALENDAR_MONTH_SHIFTS", default=[-1, 0, 1])
+    today = _env_bool("CALENDAR_TODAY", True)
+    date_shift = os.environ.get("CALENDAR_DATE_SHIFT", "0").strip() or "0"
+    scan_seconds = _env_int("CALENDAR_SCAN_SECONDS", 90)
+
+    config = {
+        "month_shifts": month_shifts,
+        "today": today,
+        "date_shift": date_shift,
+        "scan_seconds": scan_seconds,
+        "render_timeout_seconds": _env_int("CALENDAR_RENDER_TIMEOUT", 300),
+    }
+
+    logger.info(
+        "Calendar scan config: "
+        f"month_shifts={config['month_shifts']}, "
+        f"today={config['today']}, "
+        f"date_shift={config['date_shift']}, "
+        f"scan_seconds={config['scan_seconds']}, "
+        f"render_timeout={config['render_timeout_seconds']}"
+    )
+
+    items_by_resid: Dict[str, Dict[str, Any]] = {}
+    views_scanned: List[Dict[str, Any]] = []
+
     try:
-        # If we got redirected back to login, re-auth and reload calendar.
-        if "login" in (driver.current_url or "").lower():
-            logger.warning("Calendar URL redirected to login; re-authenticating...")
-            login_to_otelms(driver)
-            driver.get(OTELMS_CALENDAR_URL)
+        for ms in month_shifts:
+            logger.info(f"Loading calendar view: month_shift={ms}, today={today}, date_shift={date_shift}")
+            rendered_count = _load_calendar_view(driver, month_shift=ms, today=today, date_shift=date_shift)
+            logger.info(f"Rendered {rendered_count} booking nodes in view month_shift={ms}")
 
-        # Wait for actual rendered bookings (not just page load).
-        render_timeout = int(os.environ.get("CALENDAR_RENDER_TIMEOUT", "120"))
-        logger.info(f"Waiting for calendar bookings to render (timeout={render_timeout}s)...")
-        rendered_count = ensure_calendar_rendered(driver, OTELMS_CALENDAR_URL, timeout_seconds=render_timeout)
-        logger.info(f"Calendar bookings rendered: {rendered_count} elements with resid")
+            if _debug_artifacts_enabled():
+                save_debug_artifacts(driver, f'calendar_view_ms_{ms}', extra=collect_calendar_diagnostics(driver))
 
-        save_debug_artifacts(driver, 'calendar_rendered', extra=collect_calendar_diagnostics(driver))
-        
-        # Extract booking blocks
-        data_rows = []
-        seen_bookings = set()
+            raw_items = scan_calendar_items(driver, max_scan_seconds=scan_seconds)
+            views_scanned.append({"month_shift": ms, "rendered_count": rendered_count, "scanned_count": len(raw_items)})
+            logger.info(f"Scanned {len(raw_items)} unique items in this view (month_shift={ms})")
 
-        # Scan (scroll) + extract via JS to avoid stale element reference issues and DOM virtualization.
-        scan_seconds = int(os.environ.get("CALENDAR_SCAN_SECONDS", "60"))
-        raw_items = scan_calendar_items(driver, max_scan_seconds=scan_seconds)
-        logger.info(f"Found {len(raw_items)} booking blocks (scan + JS extraction)")
-
-        for item in raw_items:
-            try:
+            for item in raw_items:
                 resid = (item.get("resid") or "").strip()
-                if not resid or resid in seen_bookings:
+                if not resid:
                     continue
-                seen_bookings.add(resid)
 
-                status = (item.get("status") or "").strip()
-                element_id = (item.get("element_id") or "").strip()
-                booking_nam = (item.get("booking_nam") or "").strip()
-                booking_info = (item.get("booking_info") or "").strip().rstrip(",")
-                balance = (item.get("balance") or "").strip()
+                # Normalize / enrich
                 tooltip = (item.get("tooltip") or "").strip()
+                tooltip_fields = _parse_tooltip_fields(tooltip)
 
-                booking_id = None
-                guest_name = None
-
-                # Parse calendar_booking_nam: "B:7296,  ჯაბა პაშკოვსკი, "
+                # Parse `booking_nam` (fast path)
+                booking_nam = (item.get("booking_nam") or "").strip()
+                booking_id = ""
+                guest_name = ""
                 if "B:" in booking_nam:
                     parts = booking_nam.split("B:", 1)[1].split(",")
                     if len(parts) >= 2:
                         booking_id = parts[0].strip()
                         guest_name = parts[1].strip()
 
-                # Keep the record even if name parsing fails; resid is still a booking identifier.
-                data_rows.append({
+                # Fall back to tooltip if parsing failed
+                booking_id = booking_id or tooltip_fields.get("booking_id", "") or resid
+                guest_name = guest_name or tooltip_fields.get("guest_name", "")
+
+                source = (item.get("booking_info") or "").strip().rstrip(",") or tooltip_fields.get("source", "")
+                balance = (item.get("balance") or "").strip() or tooltip_fields.get("balance", "")
+
+                candidate: Dict[str, Any] = {
                     "resid": resid,
-                    "booking_id": booking_id or resid,  # Fallback to resid
-                    "guest_name": guest_name or "",
-                    "source": booking_info,
+                    "booking_id": booking_id,
+                    "guest_name": guest_name,
+                    "source": source,
                     "balance": balance,
-                    "status": status,
-                    "element_id": element_id,
-                    "tooltip": tooltip,
+                    "status": (item.get("status") or "").strip(),
+                    "element_id": (item.get("element_id") or "").strip(),
+                    "date_in": tooltip_fields.get("date_in", ""),
+                    "date_out": tooltip_fields.get("date_out", ""),
+                    "phone": tooltip_fields.get("phone", ""),
+                    "responsible": tooltip_fields.get("responsible", ""),
+                    "tooltip": tooltip if _debug_artifacts_enabled() else "",
+                    "calendar_month_shift": ms,
                     "extracted_at": datetime.utcnow().isoformat() + "Z",
-                })
-            except Exception as e:
-                logger.error(f"Error parsing booking item: {e}")
-                continue
-        
-        logger.info(f"Extracted {len(data_rows)} unique booking records")
-        return data_rows
-        
+                }
+
+                existing = items_by_resid.get(resid)
+                if not existing:
+                    items_by_resid[resid] = candidate
+                else:
+                    # Merge: keep the first but fill missing fields with newer data.
+                    for k, v in candidate.items():
+                        if k not in existing or existing[k] in ("", None):
+                            existing[k] = v
+
+        data_rows = list(items_by_resid.values())
+        logger.info(f"Extracted {len(data_rows)} unique booking records across {len(month_shifts)} views")
+        return {
+            "rows": data_rows,
+            "views_scanned": views_scanned,
+            "config": config,
+        }
+
     except TimeoutException:
         save_debug_artifacts(driver, 'calendar_timeout', extra=collect_calendar_diagnostics(driver))
         raise Exception("Calendar render timeout - booking blocks not found")
@@ -631,13 +804,18 @@ def scrape():
         
         # Extract data with retry
         extract_func = retry_on_failure(lambda: extract_calendar_data(driver))
-        calendar_data = extract_func()
+        extract_result = extract_func()
+        calendar_data = extract_result.get("rows", [])
+        views_scanned = extract_result.get("views_scanned", [])
+        scan_config = extract_result.get("config", {})
         
         if not calendar_data:
             return jsonify({
                 'status': 'warning',
                 'message': 'No data extracted (calendar may be empty)',
                 'data_points': 0,
+                'views_scanned': views_scanned,
+                'scan_config': scan_config,
                 'timestamp': datetime.utcnow().isoformat() + 'Z'
             }), 200
         
@@ -657,6 +835,8 @@ def scrape():
             'filename': filename,
             'rows_synced': rows_synced,
             'data_points': len(calendar_data),
+            'views_scanned': views_scanned,
+            'scan_config': scan_config,
             'elapsed_seconds': round(elapsed, 2),
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }), 200
