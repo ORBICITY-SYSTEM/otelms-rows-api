@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.6"
+SCRAPER_VERSION = "v12.7"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -797,6 +797,17 @@ def _rows_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+def _rows_get(path: str) -> requests.Response:
+    url = f"https://api.rows.com/v1{path}"
+    return requests.get(url, headers={"Authorization": f"Bearer {ROWS_API_KEY}"}, timeout=30)
+
+def _rows_post_json(path: str, payload: Any, accept_json: bool = True) -> requests.Response:
+    url = f"https://api.rows.com/v1{path}"
+    headers = _rows_headers().copy()
+    if accept_json:
+        headers["Accept"] = "application/json"
+    return requests.post(url, headers=headers, json=payload, timeout=30)
+
 def _a1_col(n: int) -> str:
     """1-indexed column number -> A1-style column label (A, B, ..., AA, AB, ...)."""
     if n <= 0:
@@ -869,6 +880,37 @@ def _rows_append_values(table_id: str, values: List[List[Any]]) -> bool:
         return False
 
     return False
+
+def _rows_overwrite_cells(table_id: str, a1_range: str, row_values: List[str]) -> bool:
+    """
+    Write a single row into an explicit range using the official cells/{range} overwrite endpoint.
+    """
+    encoded_range = _urlquote(a1_range, safe="")
+    cells_row = [{"value": v} for v in row_values]
+    payload = {"cells": [cells_row]}
+    resp = _rows_post_json(
+        f"/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/cells/{encoded_range}",
+        payload,
+        accept_json=True,
+    )
+    if resp.status_code in (200, 202):
+        return True
+    logger.error(f"Rows overwrite cells failed: {resp.status_code} - {resp.text}")
+    return False
+
+def _rows_create_table(page_id: str, name: str) -> Optional[Dict[str, Any]]:
+    resp = _rows_post_json(
+        f"/spreadsheets/{ROWS_SPREADSHEET_ID}/pages/{page_id}/tables",
+        {"name": name},
+        accept_json=True,
+    )
+    if resp.status_code in (200, 201):
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    logger.error(f"Rows create table failed: {resp.status_code} - {resp.text}")
+    return None
 
 def sync_to_rows(data: List[Dict], table_id: str, mode: str, mapper) -> bool:
     """Sync data to Rows.com (append or best-effort overwrite)."""
@@ -1547,6 +1589,91 @@ def scrape_rlist_custom():
                 driver.quit()
             except Exception:
                 pass
+
+@app.route('/rows/bootstrap/rlist', methods=['POST'])
+def rows_bootstrap_rlist():
+    """
+    Create three Rows tables (created/checkin/checkout) for rlist ingestion, and write header rows.
+
+    Default mapping:
+      created  -> Page1
+      checkin  -> Page2
+      checkout -> Page3
+
+    Body (optional):
+      {
+        "page_names": {"created":"Page1","checkin":"Page2","checkout":"Page3"},
+        "table_names": {"created":"OTELMS RList (Created)","checkin":"OTELMS RList (Check-in)","checkout":"OTELMS RList (Check-out)"}
+      }
+    """
+    if not ROWS_API_KEY or not ROWS_SPREADSHEET_ID:
+        return jsonify({"status": "error", "message": "ROWS_API_KEY and ROWS_SPREADSHEET_ID must be configured"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    page_names = payload.get("page_names") or {"created": "Page1", "checkin": "Page2", "checkout": "Page3"}
+    table_names = payload.get("table_names") or {
+        "created": "OTELMS RList (Created)",
+        "checkin": "OTELMS RList (Check-in)",
+        "checkout": "OTELMS RList (Check-out)",
+    }
+
+    # Header schema for rlist (stable order)
+    header = [
+        "room", "guest", "source", "check_in", "nights", "check_out",
+        "amount", "paid", "balance", "created_at",
+        "range_start", "range_end", "extracted_at",
+    ]
+    header_range = f"A1:{_a1_col(len(header))}1"
+
+    # Fetch spreadsheet info to map page name -> page_id
+    resp = _rows_get(f"/spreadsheets/{ROWS_SPREADSHEET_ID}")
+    if resp.status_code != 200:
+        return jsonify({"status": "error", "message": f"Rows spreadsheet fetch failed: {resp.status_code} - {resp.text}"}), 500
+
+    ss = resp.json()
+    pages = ss.get("pages") or []
+    page_name_to_id = {str(p.get("name")): str(p.get("id")) for p in pages if p.get("id") and p.get("name")}
+
+    created: Dict[str, Any] = {}
+    for key in ("created", "checkin", "checkout"):
+        pn = str(page_names.get(key) or "").strip()
+        if not pn or pn not in page_name_to_id:
+            created[key] = {"ok": False, "error": f"Page '{pn}' not found in spreadsheet"}
+            continue
+
+        page_id = page_name_to_id[pn]
+        tname = str(table_names.get(key) or f"OTELMS RList ({key})")
+
+        t = _rows_create_table(page_id, tname)
+        if not t or not t.get("id"):
+            created[key] = {"ok": False, "error": "Failed to create table"}
+            continue
+
+        table_id = str(t.get("id"))
+        ok_header = _rows_overwrite_cells(table_id, header_range, header)
+        created[key] = {
+            "ok": True,
+            "page_name": pn,
+            "page_id": page_id,
+            "table_name": tname,
+            "table_id": table_id,
+            "header_written": ok_header,
+        }
+
+    # Provide env var hints
+    env_hints = {
+        "ROWS_RLIST_CREATED_TABLE_ID": created.get("created", {}).get("table_id", ""),
+        "ROWS_RLIST_CHECKIN_TABLE_ID": created.get("checkin", {}).get("table_id", ""),
+        "ROWS_RLIST_CHECKOUT_TABLE_ID": created.get("checkout", {}).get("table_id", ""),
+    }
+
+    return jsonify({
+        "status": "success",
+        "created": created,
+        "env_hints": env_hints,
+        "note": "Add the env_hints values to Cloud Run env.yaml and redeploy.",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }), 200
 
 @app.route('/health', methods=['GET'])
 def health():
