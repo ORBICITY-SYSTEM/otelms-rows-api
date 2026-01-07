@@ -21,7 +21,7 @@ import requests
 from urllib.parse import quote as _urlquote
 from datetime import datetime
 from typing import List, Dict, Optional, Any
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.5"
+SCRAPER_VERSION = "v12.6"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -91,12 +91,16 @@ OTELMS_PASSWORD = os.environ['OTELMS_PASSWORD']
 OTELMS_LOGIN_URL = "https://116758.otelms.com/login_c2/"
 OTELMS_CALENDAR_URL = "https://116758.otelms.com/reservation_c2/calendar/"
 OTELMS_STATUS_URL = "https://116758.otelms.com/reservation_c2/status"
+OTELMS_RLIST_URL = "https://116758.otelms.com/reservation_c2/rlist/1"
 GCS_BUCKET = os.environ['GCS_BUCKET']
 ROWS_API_KEY = os.environ.get('ROWS_API_KEY', '' )
 ROWS_SPREADSHEET_ID = os.environ.get('ROWS_SPREADSHEET_ID', '')
 ROWS_TABLE_ID = os.environ.get('ROWS_TABLE_ID', 'Table1')
 ROWS_CALENDAR_TABLE_ID = os.environ.get('ROWS_CALENDAR_TABLE_ID', ROWS_TABLE_ID)
 ROWS_STATUS_TABLE_ID = os.environ.get('ROWS_STATUS_TABLE_ID', 'Status')
+ROWS_RLIST_CREATED_TABLE_ID = os.environ.get('ROWS_RLIST_CREATED_TABLE_ID', '')
+ROWS_RLIST_CHECKIN_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKIN_TABLE_ID', '')
+ROWS_RLIST_CHECKOUT_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKOUT_TABLE_ID', '')
 ROWS_SYNC_MODE = os.environ.get('ROWS_SYNC_MODE', 'append').strip().lower()  # append|overwrite
 
 MAX_RETRIES = 3
@@ -959,6 +963,165 @@ def extract_status_data(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
     logger.info(f"Extracted {len(rows)} status items")
     return rows
 
+def _set_rlist_date_range(driver: webdriver.Chrome, start_date: str, end_date: str) -> None:
+    """
+    Attempt to set the rlist date range filter.
+    UI shows a single date-range input like "YYYY-MM-DD - YYYY-MM-DD".
+    We try common patterns:
+    - Any input containing " - " and matching YYYY-MM-DD.
+    - Two separate date inputs (start/end).
+    """
+    driver.execute_script(
+        """
+        const start = arguments[0];
+        const end = arguments[1];
+        const rangeValue = `${start} - ${end}`;
+
+        const inputs = Array.from(document.querySelectorAll('input'));
+        // Prefer a single range input that already contains " - "
+        const range = inputs.find(i => (i.value || '').includes(' - ') && (i.value || '').match(/\\d{4}-\\d{2}-\\d{2}/));
+        if (range) {
+          range.focus();
+          range.value = rangeValue;
+          range.dispatchEvent(new Event('input', {bubbles:true}));
+          range.dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        }
+
+        // Fallback: find two date inputs
+        const dateInputs = inputs.filter(i => (i.type || '').toLowerCase() === 'text' && (i.value || '').match(/^\\d{4}-\\d{2}-\\d{2}$/));
+        if (dateInputs.length >= 2) {
+          dateInputs[0].focus();
+          dateInputs[0].value = start;
+          dateInputs[0].dispatchEvent(new Event('input', {bubbles:true}));
+          dateInputs[0].dispatchEvent(new Event('change', {bubbles:true}));
+          dateInputs[1].focus();
+          dateInputs[1].value = end;
+          dateInputs[1].dispatchEvent(new Event('input', {bubbles:true}));
+          dateInputs[1].dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        }
+        return false;
+        """,
+        start_date,
+        end_date,
+    )
+
+def _set_rlist_sort(driver: webdriver.Chrome, sort_mode: str) -> None:
+    """
+    Sort modes requested:
+      - created: "შექმნის თარიღი"
+      - checkin: "შესვლის თარიღი"
+      - checkout: "გასვლის თარიღი"
+    We select by visible text on any <select>.
+    """
+    sort_text = {
+        "created": "შექმნის თარიღი",
+        "checkin": "შესვლის თარიღი",
+        "checkout": "გასვლის თარიღი",
+    }.get(sort_mode, "შექმნის თარიღი")
+
+    driver.execute_script(
+        """
+        const target = arguments[0];
+        const selects = Array.from(document.querySelectorAll('select'));
+        for (const sel of selects) {
+          const opt = Array.from(sel.options || []).find(o => (o.textContent||'').trim() === target);
+          if (!opt) continue;
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        }
+        return false;
+        """,
+        sort_text,
+    )
+
+def _click_rlist_search(driver: webdriver.Chrome) -> None:
+    """Click the search button on rlist (best-effort)."""
+    driver.execute_script(
+        """
+        const candidates = Array.from(document.querySelectorAll('button,input[type="submit"]'));
+        const btn = candidates.find(b => ((b.textContent||'') + ' ' + (b.value||'')).toLowerCase().includes('ძიებ') || ((b.textContent||'') + ' ' + (b.value||'')).toLowerCase().includes('search'));
+        if (btn) { btn.click(); return true; }
+        // Fallback: click any primary button
+        const primary = candidates.find(b => (b.className||'').toLowerCase().includes('btn') && (b.className||'').toLowerCase().includes('primary'));
+        if (primary) { primary.click(); return true; }
+        return false;
+        """
+    )
+
+def extract_rlist_data(driver: webdriver.Chrome, start_date: str, end_date: str, sort_mode: str) -> List[Dict[str, Any]]:
+    """Extract reporting list rows from /reservation_c2/rlist/1 for a date range and sort mode."""
+    logger.info(f"Loading rlist page (sort={sort_mode})...")
+    driver.get(OTELMS_RLIST_URL)
+
+    if "login" in (driver.current_url or "").lower():
+        logger.warning("Rlist URL redirected to login; re-authenticating...")
+        login_to_otelms(driver)
+        driver.get(OTELMS_RLIST_URL)
+
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+    time.sleep(1.0)
+
+    _set_rlist_date_range(driver, start_date=start_date, end_date=end_date)
+    _set_rlist_sort(driver, sort_mode=sort_mode)
+    _click_rlist_search(driver)
+
+    # Wait for table to be present
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+    time.sleep(1.0)
+
+    payload = driver.execute_script(
+        """
+        function clean(s){ return (s||'').replace(/\\s+/g,' ').trim(); }
+        const table = document.querySelector('table');
+        if (!table) return {headers: [], rows: []};
+        const thead = table.querySelector('thead');
+        const tbody = table.querySelector('tbody');
+        const headerCells = Array.from((thead ? thead.querySelectorAll('th') : table.querySelectorAll('tr th')) || []);
+        const headers = headerCells.map(th => clean(th.textContent));
+        const bodyRows = Array.from((tbody ? tbody.querySelectorAll('tr') : table.querySelectorAll('tbody tr')) || []);
+        const rows = bodyRows.map(tr => Array.from(tr.querySelectorAll('td')).map(td => clean(td.textContent)));
+        return {headers, rows};
+        """
+    ) or {"headers": [], "rows": []}
+
+    headers: List[str] = payload.get("headers") or []
+    rows_raw: List[List[str]] = payload.get("rows") or []
+
+    # Fallback: if headers missing, use expected schema by column positions from screenshot.
+    # Columns shown: #, room, guest, source, checkin, nights, checkout, amount, paid, balance, created_at
+    if not headers or len(headers) < 8:
+        headers = ["#", "room", "guest", "source", "check_in", "nights", "check_out", "amount", "paid", "balance", "created_at"]
+
+    out: List[Dict[str, Any]] = []
+    for r in rows_raw:
+        if not r or all(not c for c in r):
+            continue
+        # Map by position to stable keys (ignore localized header variations)
+        def get(i: int) -> str:
+            return r[i].strip() if i < len(r) else ""
+        out.append({
+            "room": get(1),
+            "guest": get(2),
+            "source": get(3),
+            "check_in": get(4),
+            "nights": get(5),
+            "check_out": get(6),
+            "amount": get(7),
+            "paid": get(8),
+            "balance": get(9),
+            "created_at": get(10),
+            "sort_mode": sort_mode,
+            "range_start": start_date,
+            "range_end": end_date,
+            "extracted_at": datetime.utcnow().isoformat() + "Z",
+        })
+
+    logger.info(f"Extracted {len(out)} rlist rows (sort={sort_mode})")
+    return out
+
 @app.route('/', methods=['GET', 'POST'])
 @app.route('/scrape', methods=['GET', 'POST'])
 def scrape():
@@ -1136,6 +1299,136 @@ def scrape_all():
             "status": "success",
             "calendar": {"data_points": len(calendar_rows), "filename": calendar_file},
             "status_page": {"data_points": len(status_rows), "filename": status_file},
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 200
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"ERROR after {elapsed:.2f}s: {e}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+@app.route('/scrape/rlist/dec2025', methods=['GET', 'POST'])
+def scrape_rlist_dec2025():
+    """Extract Dec 2025 rlist in three sorts into three tables."""
+    driver = None
+    start_time = time.time()
+
+    try:
+        driver = setup_driver()
+        login_to_otelms(driver)
+
+        start_date = "2025-12-01"
+        end_date = "2025-12-31"
+
+        results: Dict[str, Any] = {"status": "success", "range": {"start": start_date, "end": end_date}, "runs": {}}
+        for mode, table_id in (("created", ROWS_RLIST_CREATED_TABLE_ID), ("checkin", ROWS_RLIST_CHECKIN_TABLE_ID), ("checkout", ROWS_RLIST_CHECKOUT_TABLE_ID)):
+            data = extract_rlist_data(driver, start_date=start_date, end_date=end_date, sort_mode=mode)
+            gcs_file = save_json_to_gcs(data, GCS_BUCKET, prefix=f"otelms_rlist_{mode}")
+            rows_ok = False
+            if table_id:
+                rows_ok = sync_to_rows(
+                    data,
+                    table_id=table_id,
+                    mode=ROWS_SYNC_MODE,
+                    mapper=lambda item: [
+                        item.get("room", ""),
+                        item.get("guest", ""),
+                        item.get("source", ""),
+                        item.get("check_in", ""),
+                        item.get("nights", ""),
+                        item.get("check_out", ""),
+                        item.get("amount", ""),
+                        item.get("paid", ""),
+                        item.get("balance", ""),
+                        item.get("created_at", ""),
+                        item.get("range_start", ""),
+                        item.get("range_end", ""),
+                        item.get("extracted_at", ""),
+                    ],
+                )
+            results["runs"][mode] = {"data_points": len(data), "filename": gcs_file, "rows_synced": rows_ok, "rows_table_id_set": bool(table_id)}
+
+        elapsed = time.time() - start_time
+        results["elapsed_seconds"] = round(elapsed, 2)
+        results["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        return jsonify(results), 200
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"ERROR after {elapsed:.2f}s: {e}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+@app.route('/scrape/rlist', methods=['POST'])
+def scrape_rlist_custom():
+    """Custom rlist scrape: JSON body {start_date,end_date,sort_mode,table_id(optional)}."""
+    driver = None
+    start_time = time.time()
+    try:
+        payload = request.get_json(silent=True) or {}
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        sort_mode = str(payload.get("sort_mode") or "created").strip()
+        table_id = str(payload.get("table_id") or "").strip()
+        if not start_date or not end_date:
+            return jsonify({"status": "error", "message": "start_date and end_date are required (YYYY-MM-DD)"}), 400
+
+        driver = setup_driver()
+        login_to_otelms(driver)
+
+        data = extract_rlist_data(driver, start_date=start_date, end_date=end_date, sort_mode=sort_mode)
+        gcs_file = save_json_to_gcs(data, GCS_BUCKET, prefix=f"otelms_rlist_{sort_mode}")
+
+        rows_ok = False
+        if table_id:
+            rows_ok = sync_to_rows(
+                data,
+                table_id=table_id,
+                mode=ROWS_SYNC_MODE,
+                mapper=lambda item: [
+                    item.get("room", ""),
+                    item.get("guest", ""),
+                    item.get("source", ""),
+                    item.get("check_in", ""),
+                    item.get("nights", ""),
+                    item.get("check_out", ""),
+                    item.get("amount", ""),
+                    item.get("paid", ""),
+                    item.get("balance", ""),
+                    item.get("created_at", ""),
+                    item.get("range_start", ""),
+                    item.get("range_end", ""),
+                    item.get("extracted_at", ""),
+                ],
+            )
+
+        elapsed = time.time() - start_time
+        return jsonify({
+            "status": "success",
+            "message": f"Extracted {len(data)} rlist rows ({sort_mode})",
+            "filename": gcs_file,
+            "rows_synced": rows_ok,
+            "data_points": len(data),
             "elapsed_seconds": round(elapsed, 2),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }), 200
