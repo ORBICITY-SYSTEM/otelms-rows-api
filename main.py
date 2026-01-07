@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.1"
+SCRAPER_VERSION = "v12.2"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -89,10 +89,14 @@ OTELMS_USERNAME = os.environ['OTELMS_USERNAME']
 OTELMS_PASSWORD = os.environ['OTELMS_PASSWORD']
 OTELMS_LOGIN_URL = "https://116758.otelms.com/login_c2/"
 OTELMS_CALENDAR_URL = "https://116758.otelms.com/reservation_c2/calendar/"
+OTELMS_STATUS_URL = "https://116758.otelms.com/reservation_c2/status"
 GCS_BUCKET = os.environ['GCS_BUCKET']
 ROWS_API_KEY = os.environ.get('ROWS_API_KEY', '' )
 ROWS_SPREADSHEET_ID = os.environ.get('ROWS_SPREADSHEET_ID', '')
 ROWS_TABLE_ID = os.environ.get('ROWS_TABLE_ID', 'Table1')
+ROWS_CALENDAR_TABLE_ID = os.environ.get('ROWS_CALENDAR_TABLE_ID', ROWS_TABLE_ID)
+ROWS_STATUS_TABLE_ID = os.environ.get('ROWS_STATUS_TABLE_ID', 'Status')
+ROWS_SYNC_MODE = os.environ.get('ROWS_SYNC_MODE', 'append').strip().lower()  # append|overwrite
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -750,63 +754,180 @@ def save_to_gcs(data: List[Dict], bucket_name: str) -> str:
         logger.error(f"GCS save failed: {e}")
         raise
 
-def sync_to_rows(data: List[Dict]) -> bool:
-    """Sync data to Rows.com with proper append logic and rate limit handling"""
+def save_json_to_gcs(data: Any, bucket_name: str, prefix: str) -> str:
+    """Save arbitrary JSON-serializable data to GCS."""
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    if not bucket.exists():
+        raise Exception(f"GCS bucket '{bucket_name}' does not exist")
+
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    filename = f'{prefix}_{timestamp}.json'
+    blob = bucket.blob(filename)
+    blob.upload_from_string(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        content_type='application/json'
+    )
+    logger.info(f"Saved to gs://{bucket_name}/{filename}")
+    return filename
+
+def _rows_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {ROWS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def _rows_clear_table(table_id: str) -> bool:
+    """
+    Best-effort "overwrite" support. Rows API has evolved; we attempt common clear endpoints.
+    If unsupported, we fall back to append mode.
+    """
+    # Candidate endpoints (try in order)
+    candidates = [
+        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values:clear",
+        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values/clear",
+    ]
+    for url in candidates:
+        try:
+            resp = requests.post(url, headers=_rows_headers(), json={}, timeout=30)
+            if resp.status_code in (200, 204):
+                logger.info(f"Rows table cleared via {url}")
+                return True
+            if resp.status_code in (404, 405):
+                continue
+            logger.warning(f"Rows clear failed ({resp.status_code}) via {url}: {resp.text}")
+        except Exception as e:
+            logger.warning(f"Rows clear error via {url}: {e}")
+    return False
+
+def _rows_append_values(table_id: str, values: List[List[Any]]) -> bool:
+    url = f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values:append"
+    payload = {"values": values}
+    for attempt in range(3):
+        resp = requests.post(url, headers=_rows_headers(), json=payload, timeout=30)
+        if resp.status_code in (200, 201):
+            return True
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 60))
+            logger.warning(f"Rows rate limited, retrying after {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+        logger.error(f"Rows append failed: {resp.status_code} - {resp.text}")
+        return False
+    return False
+
+def sync_to_rows(data: List[Dict], table_id: str, mode: str, mapper) -> bool:
+    """Sync data to Rows.com (append or best-effort overwrite)."""
     if not ROWS_API_KEY or not ROWS_SPREADSHEET_ID:
         logger.info("Rows.com credentials not configured, skipping sync")
         return False
     
     try:
-        logger.info(f"Syncing {len(data)} records to Rows.com...")
-        
-        # Rows.com API endpoint for appending
-        url = f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{ROWS_TABLE_ID}/values:append"
-        
-        headers = {
-            "Authorization": f"Bearer {ROWS_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        # Prepare rows
-        rows_data = []
-        for item in data:
-            rows_data.append([
-                item.get('booking_id', '' ),
-                item.get('guest_name', ''),
-                item.get('source', ''),
-                item.get('balance', ''),
-                item.get('status', ''),
-                item.get('resid', ''),
-                item.get('extracted_at', '')
-            ])
-        
-        payload = {"values": rows_data}
-        
-        # Retry with exponential backoff for rate limits
-        for attempt in range(3):
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
-            if response.status_code in [200, 201]:
-                logger.info(f"Successfully synced {len(rows_data)} rows to Rows.com")
-                return True
-            elif response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                logger.warning(f"Rate limited, retrying after {retry_after}s...")
-                time.sleep(retry_after)
+        rows_values = [mapper(item) for item in data]
+        logger.info(f"Syncing {len(rows_values)} records to Rows.com (table={table_id}, mode={mode})...")
+
+        if mode == "overwrite":
+            cleared = _rows_clear_table(table_id)
+            if not cleared:
+                logger.warning("Rows overwrite requested but clear endpoint unavailable; falling back to append")
             else:
-                logger.error(f"Rows.com sync failed: {response.status_code} - {response.text}")
-                return False
-        
-        return False
+                logger.info("Rows table cleared; proceeding with append of full dataset")
+
+        ok = _rows_append_values(table_id, rows_values)
+        if ok:
+            logger.info(f"Successfully synced {len(rows_values)} rows to Rows.com")
+        return ok
             
     except Exception as e:
         logger.error(f"Rows.com sync error: {e}")
         return False
 
+def extract_status_data(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
+    """
+    Extract data from /reservation_c2/status (daily operational view).
+    Since OTELMS UI can vary, we use robust heuristics:
+    - Collect links/texts containing booking numbers like "#7504"
+    - Extract booking_id, room, guest (best-effort), and raw text
+    """
+    logger.info("Loading status page...")
+    driver.get(OTELMS_STATUS_URL)
+
+    if "login" in (driver.current_url or "").lower():
+        logger.warning("Status URL redirected to login; re-authenticating...")
+        login_to_otelms(driver)
+        driver.get(OTELMS_STATUS_URL)
+
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+    # Let dynamic widgets settle
+    time.sleep(1.0)
+
+    items = driver.execute_script(
+        r"""
+        function clean(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+        function findColumnTitle(el){
+          // Walk up and try to find a nearby header element
+          let cur = el;
+          for (let i=0;i<6 && cur;i++){
+            const header = cur.querySelector && cur.querySelector('h1,h2,h3,h4,.title,.panel-title');
+            if (header && clean(header.textContent)) return clean(header.textContent);
+            cur = cur.parentElement;
+          }
+          return '';
+        }
+        const out = [];
+        const candidates = Array.from(document.querySelectorAll('a,div,span,li'));
+        const seen = new Set();
+        for (const el of candidates){
+          const t = clean(el.textContent);
+          if (!t) continue;
+          const m = t.match(/#(\d{3,})/);
+          if (!m) continue;
+          const booking_id = m[1];
+          const key = booking_id + '|' + t;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({
+            booking_id,
+            text: t,
+            href: el.getAttribute && (el.getAttribute('href') || ''),
+            column: findColumnTitle(el)
+          });
+        }
+        return out;
+        """
+    ) or []
+
+    # Normalize output
+    rows: List[Dict[str, Any]] = []
+    for it in items:
+        try:
+            booking_id = str(it.get("booking_id") or "").strip()
+            if not booking_id:
+                continue
+            text = str(it.get("text") or "")
+            # Attempt to extract room like "C 1256" or "A 1806"
+            room = ""
+            m_room = re.search(r"\b([A-Z])\s*([0-9]{3,4})\b", text)
+            if m_room:
+                room = f"{m_room.group(1)} {m_room.group(2)}"
+            rows.append({
+                "booking_id": booking_id,
+                "room": room,
+                "column": str(it.get("column") or ""),
+                "href": str(it.get("href") or ""),
+                "text": text,
+                "extracted_at": datetime.utcnow().isoformat() + "Z",
+            })
+        except Exception:
+            continue
+
+    logger.info(f"Extracted {len(rows)} status items")
+    return rows
+
 @app.route('/', methods=['GET', 'POST'])
 @app.route('/scrape', methods=['GET', 'POST'])
 def scrape():
-    """Main scraping endpoint with comprehensive error handling"""
+    """Calendar scraping endpoint (backwards compatible)."""
     driver = None
     start_time = time.time()
     
@@ -839,10 +960,27 @@ def scrape():
             }), 200
         
         # Save to GCS
-        filename = save_to_gcs(calendar_data, GCS_BUCKET)
-        
-        # Sync to Rows.com
-        rows_synced = sync_to_rows(calendar_data)
+        filename = save_json_to_gcs(calendar_data, GCS_BUCKET, prefix="otelms_calendar")
+
+        # Sync to Rows.com (calendar)
+        rows_synced = sync_to_rows(
+            calendar_data,
+            table_id=ROWS_CALENDAR_TABLE_ID,
+            mode=ROWS_SYNC_MODE,
+            mapper=lambda item: [
+                item.get('booking_id', ''),
+                item.get('guest_name', ''),
+                item.get('source', ''),
+                item.get('balance', ''),
+                item.get('status', ''),
+                item.get('resid', ''),
+                item.get('date_in', ''),
+                item.get('date_out', ''),
+                item.get('phone', ''),
+                item.get('responsible', ''),
+                item.get('extracted_at', ''),
+            ],
+        )
         
         elapsed = time.time() - start_time
         
@@ -880,6 +1018,107 @@ def scrape():
                 logger.info("Browser closed")
             except Exception as e:
                 logger.error(f"Error closing browser: {e}")
+
+@app.route('/scrape/status', methods=['GET', 'POST'])
+def scrape_status():
+    """Status scraping endpoint (daily operational view)."""
+    driver = None
+    start_time = time.time()
+
+    try:
+        logger.info(f"=== OTELMS Status Scraper {SCRAPER_VERSION} Started ===")
+        driver = setup_driver()
+        logger.info("Chrome driver initialized")
+
+        login_func = retry_on_failure(lambda: login_to_otelms(driver))
+        login_func()
+
+        status_func = retry_on_failure(lambda: extract_status_data(driver))
+        status_data = status_func()
+
+        filename = save_json_to_gcs(status_data, GCS_BUCKET, prefix="otelms_status")
+
+        rows_synced = sync_to_rows(
+            status_data,
+            table_id=ROWS_STATUS_TABLE_ID,
+            mode=ROWS_SYNC_MODE,
+            mapper=lambda item: [
+                item.get('booking_id', ''),
+                item.get('room', ''),
+                item.get('column', ''),
+                item.get('href', ''),
+                item.get('text', ''),
+                item.get('extracted_at', ''),
+            ],
+        )
+
+        elapsed = time.time() - start_time
+        return jsonify({
+            "status": "success",
+            "message": f"Extracted {len(status_data)} status items",
+            "filename": filename,
+            "rows_synced": rows_synced,
+            "data_points": len(status_data),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 200
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"ERROR after {elapsed:.2f}s: {e}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+@app.route('/scrape/all', methods=['GET', 'POST'])
+def scrape_all():
+    """Run both calendar and status scrapes in one call."""
+    start_time = time.time()
+    driver = None
+
+    try:
+        logger.info(f"=== OTELMS Full Scrape {SCRAPER_VERSION} Started ===")
+        driver = setup_driver()
+        login_to_otelms(driver)
+
+        calendar_result = extract_calendar_data(driver)
+        calendar_rows = calendar_result.get("rows", [])
+        calendar_file = save_json_to_gcs(calendar_rows, GCS_BUCKET, prefix="otelms_calendar")
+
+        status_rows = extract_status_data(driver)
+        status_file = save_json_to_gcs(status_rows, GCS_BUCKET, prefix="otelms_status")
+
+        elapsed = time.time() - start_time
+        return jsonify({
+            "status": "success",
+            "calendar": {"data_points": len(calendar_rows), "filename": calendar_file},
+            "status_page": {"data_points": len(status_rows), "filename": status_file},
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 200
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"ERROR after {elapsed:.2f}s: {e}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 @app.route('/health', methods=['GET'])
 def health():
