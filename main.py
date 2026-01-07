@@ -18,6 +18,7 @@ import logging
 import re
 import html as _html
 import requests
+from urllib.parse import quote as _urlquote
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from flask import Flask, jsonify
@@ -42,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.3"
+SCRAPER_VERSION = "v12.4"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -777,6 +778,24 @@ def _rows_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+def _a1_col(n: int) -> str:
+    """1-indexed column number -> A1-style column label (A, B, ..., AA, AB, ...)."""
+    if n <= 0:
+        raise ValueError("Column index must be >= 1")
+    out = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+def _rows_append_range_for_width(width: int) -> str:
+    """
+    Rows API append requires a range in the URL (A1 notation).
+    We use the header row range (e.g. A1:K1). Rows appends after the last row.
+    """
+    last = _a1_col(width)
+    return f"A1:{last}1"
+
 def _rows_clear_table(table_id: str) -> bool:
     """
     Best-effort "overwrite" support. Rows API has evolved; we attempt common clear endpoints.
@@ -802,32 +821,33 @@ def _rows_clear_table(table_id: str) -> bool:
 
 def _rows_append_values(table_id: str, values: List[List[Any]]) -> bool:
     """
-    Rows API has had multiple route shapes over time. We try known variants:
-      - .../values:append
-      - .../values/append
+    Append rows into a table using the official Rows API endpoint:
+      POST /spreadsheets/{spreadsheet_id}/tables/{table_id}/values/{range}:append
     """
-    payload = {"values": values}
-    candidates = [
-        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values:append",
-        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values/append",
-    ]
+    if not values:
+        return True
 
-    for url in candidates:
-        for attempt in range(3):
-            resp = requests.post(url, headers=_rows_headers(), json=payload, timeout=30)
-            if resp.status_code in (200, 201):
-                return True
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
-                logger.warning(f"Rows rate limited, retrying after {retry_after}s...")
-                time.sleep(retry_after)
-                continue
-            # If the path itself isn't recognized, try the next candidate URL.
-            if resp.status_code == 404 and "Path not found" in (resp.text or ""):
-                logger.warning(f"Rows append endpoint not found via {url}, trying alternative route...")
-                break
-            logger.error(f"Rows append failed via {url}: {resp.status_code} - {resp.text}")
-            return False
+    width = max((len(r) for r in values if isinstance(r, list)), default=0)
+    if width <= 0:
+        return True
+
+    a1_range = _rows_append_range_for_width(width)
+    encoded_range = _urlquote(a1_range, safe="")
+    url = f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values/{encoded_range}:append"
+    payload = {"values": values}
+
+    for attempt in range(3):
+        resp = requests.post(url, headers=_rows_headers(), json=payload, timeout=30)
+        if resp.status_code in (200, 201):
+            return True
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 60))
+            logger.warning(f"Rows rate limited, retrying after {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+        logger.error(f"Rows append failed: {resp.status_code} - {resp.text}")
+        return False
+
     return False
 
 def sync_to_rows(data: List[Dict], table_id: str, mode: str, mapper) -> bool:
