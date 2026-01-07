@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.4"
+SCRAPER_VERSION = "v12.5"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -791,10 +791,11 @@ def _a1_col(n: int) -> str:
 def _rows_append_range_for_width(width: int) -> str:
     """
     Rows API append requires a range in the URL (A1 notation).
-    We use the header row range (e.g. A1:K1). Rows appends after the last row.
+    IMPORTANT: the range must accommodate *multiple rows* being appended.
+    Use an unbounded row range across columns (e.g. A:K), not a single row (A1:K1).
     """
     last = _a1_col(width)
-    return f"A1:{last}1"
+    return f"A:{last}"
 
 def _rows_clear_table(table_id: str) -> bool:
     """
