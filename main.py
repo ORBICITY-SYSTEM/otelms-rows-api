@@ -78,6 +78,13 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
 def _debug_artifacts_enabled() -> bool:
     return _env_bool("DEBUG_ARTIFACTS", False)
 
+def _env_str_list(name: str, default: List[str]) -> List[str]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return parts or default
+
 # Validate required environment variables
 REQUIRED_ENV_VARS = ['OTELMS_USERNAME', 'OTELMS_PASSWORD', 'GCS_BUCKET']
 for var in REQUIRED_ENV_VARS:
@@ -102,6 +109,14 @@ ROWS_RLIST_CREATED_TABLE_ID = os.environ.get('ROWS_RLIST_CREATED_TABLE_ID', '')
 ROWS_RLIST_CHECKIN_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKIN_TABLE_ID', '')
 ROWS_RLIST_CHECKOUT_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKOUT_TABLE_ID', '')
 ROWS_SYNC_MODE = os.environ.get('ROWS_SYNC_MODE', 'append').strip().lower()  # append|overwrite
+
+# Default active categories for rlist (can override via RLIST_ACTIVE_CATEGORIES env var, comma-separated)
+DEFAULT_RLIST_ACTIVE_CATEGORIES = [
+    "Suite with Sea view",
+    "Delux suite with sea view",
+    "Superior Suite with Sea View",
+    "Interconnected Family Room",
+]
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -1037,6 +1052,66 @@ def _set_rlist_sort(driver: webdriver.Chrome, sort_mode: str) -> None:
         sort_text,
     )
 
+def _set_rlist_categories(driver: webdriver.Chrome, category_names: List[str]) -> bool:
+    """
+    Enforce that only the provided categories are selected in the rlist "კატეგორია" multi-select.
+    Best-effort strategy:
+    - Prefer a <select multiple> that contains the category option labels.
+    - Fallback to toggling checkbox inputs whose nearby text matches.
+    """
+    if not category_names:
+        return False
+    selected = driver.execute_script(
+        """
+        const wanted = new Set((arguments[0] || []).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+        if (wanted.size === 0) return {ok:false, selected:0, method:"none"};
+
+        function clean(s){ return (s||'').replace(/\\s+/g,' ').trim(); }
+
+        // Strategy 1: <select multiple> with matching option texts
+        const selects = Array.from(document.querySelectorAll('select[multiple]'));
+        for (const sel of selects) {
+          const opts = Array.from(sel.options || []);
+          if (opts.length < 10) continue; // likely not categories
+          // Must contain at least one wanted label
+          const hasAny = opts.some(o => wanted.has(clean(o.textContent).toLowerCase()));
+          if (!hasAny) continue;
+          let count = 0;
+          for (const o of opts) {
+            const t = clean(o.textContent).toLowerCase();
+            const should = wanted.has(t);
+            o.selected = should;
+            if (should) count++;
+          }
+          sel.dispatchEvent(new Event('change', {bubbles:true}));
+          return {ok:true, selected:count, method:"select"};
+        }
+
+        // Strategy 2: checkbox list (often rendered by multiselect plugins)
+        const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        let selectedCount = 0;
+        for (const cb of boxes) {
+          // try to find human-readable label near checkbox
+          const labelText = clean((cb.closest('label')?.textContent) || (cb.parentElement?.textContent) || '');
+          if (!labelText) continue;
+          const key = labelText.toLowerCase();
+          const should = wanted.has(key);
+          if (cb.checked !== should) {
+            cb.checked = should;
+            cb.dispatchEvent(new Event('change', {bubbles:true}));
+          }
+          if (should) selectedCount++;
+        }
+        return {ok:true, selected:selectedCount, method:"checkbox"};
+        """,
+        category_names,
+    )
+    try:
+        logger.info(f"Rlist categories applied: method={selected.get('method')}, selected={selected.get('selected')}")
+    except Exception:
+        pass
+    return bool(selected and selected.get("ok"))
+
 def _click_rlist_search(driver: webdriver.Chrome) -> None:
     """Click the search button on rlist (best-effort)."""
     driver.execute_script(
@@ -1065,6 +1140,8 @@ def extract_rlist_data(driver: webdriver.Chrome, start_date: str, end_date: str,
     time.sleep(1.0)
 
     _set_rlist_date_range(driver, start_date=start_date, end_date=end_date)
+    active_categories = _env_str_list("RLIST_ACTIVE_CATEGORIES", DEFAULT_RLIST_ACTIVE_CATEGORIES)
+    _set_rlist_categories(driver, active_categories)
     _set_rlist_sort(driver, sort_mode=sort_mode)
     _click_rlist_search(driver)
 
