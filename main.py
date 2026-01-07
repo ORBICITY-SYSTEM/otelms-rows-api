@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v11.6"
+SCRAPER_VERSION = "v11.7"
 
 # Validate required environment variables
 REQUIRED_ENV_VARS = ['OTELMS_USERNAME', 'OTELMS_PASSWORD', 'GCS_BUCKET']
@@ -314,7 +314,7 @@ def _collect_calendar_items_js(driver: webdriver.Chrome) -> List[Dict[str, Any]]
     )
     return raw if isinstance(raw, list) else []
 
-def scan_calendar_items(driver: webdriver.Chrome, max_scan_seconds: int = 25) -> List[Dict[str, Any]]:
+def scan_calendar_items(driver: webdriver.Chrome, max_scan_seconds: int = 60) -> List[Dict[str, Any]]:
     """
     Some OTELMS calendars virtualize DOM: only visible rows' bookings exist in the DOM.
     This scans the scroll container top→bottom to accumulate all unique `resid` items.
@@ -332,37 +332,52 @@ def scan_calendar_items(driver: webdriver.Chrome, max_scan_seconds: int = 25) ->
         return list(items_by_resid.values())
 
     max_top = max(0, metrics["scrollHeight"] - metrics["clientHeight"])
-    step = max(200, int(metrics["clientHeight"] * 0.85))
+    max_left = max(0, metrics["scrollWidth"] - metrics["clientWidth"])
+    step_y = max(200, int(metrics["clientHeight"] * 0.85))
+    step_x = max(200, int(metrics["clientWidth"] * 0.85))
 
-    last_new_count = 0
+    def collect_now() -> int:
+        before = len(items_by_resid)
+        for it in _collect_calendar_items_js(driver):
+            resid = (it.get("resid") or "").strip()
+            if resid and resid not in items_by_resid:
+                items_by_resid[resid] = it
+        return len(items_by_resid) - before
+
+    # Prime with whatever is currently visible
+    collect_now()
+
     last_new_time = time.time()
 
-    # Two passes: down then up (sometimes new items render on reverse scroll).
-    for direction in (1, -1):
-        positions = range(0, max_top + 1, step) if direction == 1 else range(max_top, -1, -step)
-        for top in positions:
+    # Scan a grid of scroll positions (x and y). Some calendars virtualize both axes.
+    left_positions = list(range(0, max_left + 1, step_x))
+    if max_left not in left_positions:
+        left_positions.append(max_left)
+
+    # Two passes over X to catch late renders (0->max, then max->0)
+    for left_positions_pass in (left_positions, list(reversed(left_positions))):
+        for left in left_positions_pass:
             if time.time() - start > max_scan_seconds:
                 break
-            try:
-                _scroll_calendar_container(driver, top=top, left=0)
-            except Exception:
-                pass
-            time.sleep(0.35)
+            # Down then up for each column
+            for direction in (1, -1):
+                positions = range(0, max_top + 1, step_y) if direction == 1 else range(max_top, -1, -step_y)
+                for top in positions:
+                    if time.time() - start > max_scan_seconds:
+                        break
+                    try:
+                        _scroll_calendar_container(driver, top=top, left=left)
+                    except Exception:
+                        pass
+                    # Allow time for virtualized content to mount
+                    time.sleep(0.6)
+                    new_found = collect_now()
+                    if new_found > 0:
+                        last_new_time = time.time()
 
-            new_before = len(items_by_resid)
-            for it in _collect_calendar_items_js(driver):
-                resid = (it.get("resid") or "").strip()
-                if resid and resid not in items_by_resid:
-                    items_by_resid[resid] = it
-
-            new_after = len(items_by_resid)
-            if new_after > new_before:
-                last_new_count = new_after
-                last_new_time = time.time()
-
-            # If we've stopped discovering new items for a bit, we can stop early.
-            if last_new_count > 0 and (time.time() - last_new_time) > 3.5:
-                break
+                    # If nothing new has appeared for a while, stop early.
+                    if len(items_by_resid) > 0 and (time.time() - last_new_time) > 6.0:
+                        break
 
     # Reset scroll
     try:
@@ -461,7 +476,8 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
         seen_bookings = set()
 
         # Scan (scroll) + extract via JS to avoid stale element reference issues and DOM virtualization.
-        raw_items = scan_calendar_items(driver, max_scan_seconds=25)
+        scan_seconds = int(os.environ.get("CALENDAR_SCAN_SECONDS", "60"))
+        raw_items = scan_calendar_items(driver, max_scan_seconds=scan_seconds)
         logger.info(f"Found {len(raw_items)} booking blocks (scan + JS extraction)")
 
         for item in raw_items:
