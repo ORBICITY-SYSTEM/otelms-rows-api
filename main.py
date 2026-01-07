@@ -1,5 +1,5 @@
 """
-OTELMS Calendar Scraper v11.2 FINAL - Production Ready with Fixed Parsing
+OTELMS Calendar Scraper v11.4 FINAL - Fixed CSS Selector for Accurate Parsing
 ==========================================================================
 Bulletproof scraper with correct HTML structure parsing
 """
@@ -211,13 +211,13 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item')
+                elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item[resid]')
                 logger.info(f"Found {len(elements)} booking blocks (attempt {attempt + 1})")
                 
                 for idx, element in enumerate(elements):
                     try:
                         # Re-fetch to avoid stale reference
-                        elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item')
+                        elements = driver.find_elements(By.CSS_SELECTOR, 'div.calendar_item[resid]')
                         if idx >= len(elements):
                             break
                         element = elements[idx]
@@ -398,7 +398,7 @@ def scrape():
     start_time = time.time()
     
     try:
-        logger.info("=== OTELMS Calendar Scraper v11.2 FINAL Started ===")
+        logger.info("=== OTELMS Calendar Scraper v11.4 FINAL Started ===")
         
         # Setup browser
         driver = setup_driver()
@@ -466,7 +466,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': 'v11.2-final',
+        'version': 'v11.4-final',
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     }), 200
 
