@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.8"
+SCRAPER_VERSION = "v12.9"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -1145,6 +1145,19 @@ def _set_rlist_date_range(driver: webdriver.Chrome, start_date: str, end_date: s
         // Prefer a single range input that already contains " - "
         const range = inputs.find(i => (i.value || '').includes(' - ') && (i.value || '').match(/\\d{4}-\\d{2}-\\d{2}/));
         if (range) {
+          // If daterangepicker is used, set via its API so hidden fields update.
+          try {
+            if (window.jQuery) {
+              const $r = window.jQuery(range);
+              const drp = $r.data('daterangepicker');
+              if (drp && drp.setStartDate && drp.setEndDate) {
+                drp.setStartDate(start);
+                drp.setEndDate(end);
+                // Trigger apply
+                $r.trigger('apply.daterangepicker', drp);
+              }
+            }
+          } catch(e) {}
           range.focus();
           range.value = rangeValue;
           range.dispatchEvent(new Event('input', {bubbles:true}));
@@ -1179,10 +1192,15 @@ def _set_rlist_sort(driver: webdriver.Chrome, sort_mode: str) -> None:
       - checkout: "გასვლის თარიღი"
     We select by visible text on any <select>.
     """
+    # Match the exact dropdown labels seen in OTELMS UI.
+    # Requested:
+    # - ანგარიშგება შემოსვლის თარიღით
+    # - ანგარიშგება შექმნის თარიღის მიხედვით
+    # - ანგარიშგება განთავსების დღეების მიხედვით
     sort_text = {
         "created": "შექმნის თარიღი",
-        "checkin": "შესვლის თარიღი",
-        "checkout": "გასვლის თარიღი",
+        "checkin": "შემოსვლის თარიღი",
+        "stay_days": "განთავსების დღეები",
     }.get(sort_mode, "შექმნის თარიღი")
 
     driver.execute_script(
@@ -1610,7 +1628,11 @@ def scrape_rlist_dec2025():
         end_date = "2025-12-31"
 
         results: Dict[str, Any] = {"status": "success", "range": {"start": start_date, "end": end_date}, "runs": {}}
-        for mode, table_id in (("created", ROWS_RLIST_CREATED_TABLE_ID), ("checkin", ROWS_RLIST_CHECKIN_TABLE_ID), ("checkout", ROWS_RLIST_CHECKOUT_TABLE_ID)):
+        for mode, table_id in (
+            ("created", ROWS_RLIST_CREATED_TABLE_ID),
+            ("checkin", ROWS_RLIST_CHECKIN_TABLE_ID),
+            ("stay_days", ROWS_RLIST_CHECKOUT_TABLE_ID),
+        ):
             data = extract_rlist_data(driver, start_date=start_date, end_date=end_date, sort_mode=mode)
             gcs_file = save_json_to_gcs(data, GCS_BUCKET, prefix=f"otelms_rlist_{mode}")
             rows_ok = False
@@ -1732,25 +1754,25 @@ def rows_bootstrap_rlist():
     Create three Rows tables (created/checkin/checkout) for rlist ingestion, and write header rows.
 
     Default mapping:
-      created  -> Page1
-      checkin  -> Page2
-      checkout -> Page3
+      created   -> Page1
+      checkin   -> Page2
+      stay_days -> Page3
 
     Body (optional):
       {
-        "page_names": {"created":"Page1","checkin":"Page2","checkout":"Page3"},
-        "table_names": {"created":"OTELMS RList (Created)","checkin":"OTELMS RList (Check-in)","checkout":"OTELMS RList (Check-out)"}
+        "page_names": {"created":"Page1","checkin":"Page2","stay_days":"Page3"},
+        "table_names": {"created":"OTELMS RList (Created date)","checkin":"OTELMS RList (Check-in date)","stay_days":"OTELMS RList (Stay days)"}
       }
     """
     if not ROWS_API_KEY or not ROWS_SPREADSHEET_ID:
         return jsonify({"status": "error", "message": "ROWS_API_KEY and ROWS_SPREADSHEET_ID must be configured"}), 400
 
     payload = request.get_json(silent=True) or {}
-    page_names = payload.get("page_names") or {"created": "Page1", "checkin": "Page2", "checkout": "Page3"}
+    page_names = payload.get("page_names") or {"created": "Page1", "checkin": "Page2", "stay_days": "Page3"}
     table_names = payload.get("table_names") or {
-        "created": "OTELMS RList (Created)",
-        "checkin": "OTELMS RList (Check-in)",
-        "checkout": "OTELMS RList (Check-out)",
+        "created": "OTELMS RList (Created date)",
+        "checkin": "OTELMS RList (Check-in date)",
+        "stay_days": "OTELMS RList (Stay days)",
     }
 
     # Header schema for rlist (stable order)
@@ -1771,7 +1793,7 @@ def rows_bootstrap_rlist():
     page_name_to_id = {str(p.get("name")): str(p.get("id")) for p in pages if p.get("id") and p.get("name")}
 
     created: Dict[str, Any] = {}
-    for key in ("created", "checkin", "checkout"):
+    for key in ("created", "checkin", "stay_days"):
         pn = str(page_names.get(key) or "").strip()
         if not pn or pn not in page_name_to_id:
             created[key] = {"ok": False, "error": f"Page '{pn}' not found in spreadsheet"}
@@ -1780,12 +1802,24 @@ def rows_bootstrap_rlist():
         page_id = page_name_to_id[pn]
         tname = str(table_names.get(key) or f"OTELMS RList ({key})")
 
-        t = _rows_create_table(page_id, tname)
-        if not t or not t.get("id"):
-            created[key] = {"ok": False, "error": "Failed to create table"}
-            continue
+        # Idempotent: reuse existing table with same name on the page if present
+        existing_table_id = ""
+        for p in pages:
+            if str(p.get("id")) != page_id:
+                continue
+            for tt in (p.get("tables") or []):
+                if str(tt.get("name")) == tname and tt.get("id"):
+                    existing_table_id = str(tt.get("id"))
+                    break
+        if existing_table_id:
+            table_id = existing_table_id
+        else:
+            t = _rows_create_table(page_id, tname)
+            if not t or not t.get("id"):
+                created[key] = {"ok": False, "error": "Failed to create table"}
+                continue
+            table_id = str(t.get("id"))
 
-        table_id = str(t.get("id"))
         ok_header = _rows_overwrite_cells(table_id, header_range, header)
         created[key] = {
             "ok": True,
@@ -1800,7 +1834,7 @@ def rows_bootstrap_rlist():
     env_hints = {
         "ROWS_RLIST_CREATED_TABLE_ID": created.get("created", {}).get("table_id", ""),
         "ROWS_RLIST_CHECKIN_TABLE_ID": created.get("checkin", {}).get("table_id", ""),
-        "ROWS_RLIST_CHECKOUT_TABLE_ID": created.get("checkout", {}).get("table_id", ""),
+        "ROWS_RLIST_CHECKOUT_TABLE_ID": created.get("stay_days", {}).get("table_id", ""),
     }
 
     return jsonify({
