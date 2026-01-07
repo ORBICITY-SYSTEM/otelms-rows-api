@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.7"
+SCRAPER_VERSION = "v12.8"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -109,6 +109,8 @@ ROWS_RLIST_CREATED_TABLE_ID = os.environ.get('ROWS_RLIST_CREATED_TABLE_ID', '')
 ROWS_RLIST_CHECKIN_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKIN_TABLE_ID', '')
 ROWS_RLIST_CHECKOUT_TABLE_ID = os.environ.get('ROWS_RLIST_CHECKOUT_TABLE_ID', '')
 ROWS_SYNC_MODE = os.environ.get('ROWS_SYNC_MODE', 'append').strip().lower()  # append|overwrite
+ROWS_HISTORY_TABLE_ID = os.environ.get('ROWS_HISTORY_TABLE_ID', '')
+SKIP_ROWS_IF_UNCHANGED = _env_bool("SKIP_ROWS_IF_UNCHANGED", True)
 
 # Default active categories for rlist (can override via RLIST_ACTIVE_CATEGORIES env var, comma-separated)
 DEFAULT_RLIST_ACTIVE_CATEGORIES = [
@@ -791,6 +793,111 @@ def save_json_to_gcs(data: Any, bucket_name: str, prefix: str) -> str:
     logger.info(f"Saved to gs://{bucket_name}/{filename}")
     return filename
 
+def _gcs_read_json(bucket_name: str, blob_name: str) -> Any:
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    if not blob.exists():
+        return None
+    raw = blob.download_as_bytes()
+    return json.loads(raw.decode("utf-8"))
+
+def _gcs_write_json(bucket_name: str, blob_name: str, data: Any) -> None:
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        content_type="application/json",
+    )
+
+def _make_index(rows: List[Dict[str, Any]], key_fields: List[str]) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        parts = [str(r.get(k, "")).strip() for k in key_fields]
+        key = "|".join(parts).strip()
+        if not key or key == "|".join([""] * len(key_fields)):
+            continue
+        idx[key] = r
+    return idx
+
+def _diff_rows(prev: List[Dict[str, Any]], cur: List[Dict[str, Any]], key_fields: List[str], track_fields: List[str]) -> List[Dict[str, Any]]:
+    """
+    Return change events:
+      - create: new key appears
+      - delete: key disappears
+      - update: tracked field changed
+    """
+    prev_idx = _make_index(prev, key_fields)
+    cur_idx = _make_index(cur, key_fields)
+    now = datetime.utcnow().isoformat() + "Z"
+
+    events: List[Dict[str, Any]] = []
+
+    for k, row in cur_idx.items():
+        if k not in prev_idx:
+            events.append({
+                "source": "unknown",
+                "entity_key": k,
+                "change_type": "create",
+                "field": "",
+                "old_value": "",
+                "new_value": "",
+                "detected_at": now,
+            })
+            continue
+        old = prev_idx[k]
+        for f in track_fields:
+            ov = str(old.get(f, "")).strip()
+            nv = str(row.get(f, "")).strip()
+            if ov != nv:
+                events.append({
+                    "source": "unknown",
+                    "entity_key": k,
+                    "change_type": "update",
+                    "field": f,
+                    "old_value": ov,
+                    "new_value": nv,
+                    "detected_at": now,
+                })
+
+    for k in prev_idx.keys():
+        if k not in cur_idx:
+            events.append({
+                "source": "unknown",
+                "entity_key": k,
+                "change_type": "delete",
+                "field": "",
+                "old_value": "",
+                "new_value": "",
+                "detected_at": now,
+            })
+
+    return events
+
+def _append_history(events: List[Dict[str, Any]], source: str, snapshot_file: str) -> bool:
+    if not ROWS_HISTORY_TABLE_ID or not events:
+        return False
+    # Fill source + snapshot reference
+    for e in events:
+        e["source"] = source
+        e["snapshot_file"] = snapshot_file
+    return sync_to_rows(
+        events,
+        table_id=ROWS_HISTORY_TABLE_ID,
+        mode="append",
+        mapper=lambda item: [
+            item.get("source", ""),
+            item.get("entity_key", ""),
+            item.get("change_type", ""),
+            item.get("field", ""),
+            item.get("old_value", ""),
+            item.get("new_value", ""),
+            item.get("snapshot_file", ""),
+            item.get("detected_at", ""),
+        ],
+    )
+
 def _rows_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {ROWS_API_KEY}",
@@ -1299,28 +1406,42 @@ def scrape():
                 'timestamp': datetime.utcnow().isoformat() + 'Z'
             }), 200
         
-        # Save to GCS
+        # Save to GCS snapshot
         filename = save_json_to_gcs(calendar_data, GCS_BUCKET, prefix="otelms_calendar")
 
-        # Sync to Rows.com (calendar)
-        rows_synced = sync_to_rows(
-            calendar_data,
-            table_id=ROWS_CALENDAR_TABLE_ID,
-            mode=ROWS_SYNC_MODE,
-            mapper=lambda item: [
-                item.get('booking_id', ''),
-                item.get('guest_name', ''),
-                item.get('source', ''),
-                item.get('balance', ''),
-                item.get('status', ''),
-                item.get('resid', ''),
-                item.get('date_in', ''),
-                item.get('date_out', ''),
-                item.get('phone', ''),
-                item.get('responsible', ''),
-                item.get('extracted_at', ''),
-            ],
+        # Change detection + history (calendar)
+        state_blob = "state/latest_calendar.json"
+        prev = _gcs_read_json(GCS_BUCKET, state_blob) or []
+        events = _diff_rows(
+            prev=prev,
+            cur=calendar_data,
+            key_fields=["booking_id"],
+            track_fields=["guest_name", "source", "balance", "status", "date_in", "date_out", "phone", "responsible"],
         )
+        _append_history(events, source="calendar", snapshot_file=filename)
+        _gcs_write_json(GCS_BUCKET, state_blob, calendar_data)
+
+        # Sync to Rows.com (calendar) unless unchanged
+        rows_synced = False
+        if (not SKIP_ROWS_IF_UNCHANGED) or events:
+            rows_synced = sync_to_rows(
+                calendar_data,
+                table_id=ROWS_CALENDAR_TABLE_ID,
+                mode=ROWS_SYNC_MODE,
+                mapper=lambda item: [
+                    item.get('booking_id', ''),
+                    item.get('guest_name', ''),
+                    item.get('source', ''),
+                    item.get('balance', ''),
+                    item.get('status', ''),
+                    item.get('resid', ''),
+                    item.get('date_in', ''),
+                    item.get('date_out', ''),
+                    item.get('phone', ''),
+                    item.get('responsible', ''),
+                    item.get('extracted_at', ''),
+                ],
+            )
         
         elapsed = time.time() - start_time
         
@@ -1378,19 +1499,34 @@ def scrape_status():
 
         filename = save_json_to_gcs(status_data, GCS_BUCKET, prefix="otelms_status")
 
-        rows_synced = sync_to_rows(
-            status_data,
-            table_id=ROWS_STATUS_TABLE_ID,
-            mode=ROWS_SYNC_MODE,
-            mapper=lambda item: [
-                item.get('booking_id', ''),
-                item.get('room', ''),
-                item.get('column', ''),
-                item.get('href', ''),
-                item.get('text', ''),
-                item.get('extracted_at', ''),
-            ],
+        # Change detection + history (status)
+        state_blob = "state/latest_status.json"
+        prev = _gcs_read_json(GCS_BUCKET, state_blob) or []
+        # status entries can repeat by booking_id; use composite key
+        events = _diff_rows(
+            prev=prev,
+            cur=status_data,
+            key_fields=["booking_id", "room", "column"],
+            track_fields=["href", "text"],
         )
+        _append_history(events, source="status", snapshot_file=filename)
+        _gcs_write_json(GCS_BUCKET, state_blob, status_data)
+
+        rows_synced = False
+        if (not SKIP_ROWS_IF_UNCHANGED) or events:
+            rows_synced = sync_to_rows(
+                status_data,
+                table_id=ROWS_STATUS_TABLE_ID,
+                mode=ROWS_SYNC_MODE,
+                mapper=lambda item: [
+                    item.get('booking_id', ''),
+                    item.get('room', ''),
+                    item.get('column', ''),
+                    item.get('href', ''),
+                    item.get('text', ''),
+                    item.get('extracted_at', ''),
+                ],
+            )
 
         elapsed = time.time() - start_time
         return jsonify({
