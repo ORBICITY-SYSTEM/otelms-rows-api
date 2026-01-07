@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Scraper version
-SCRAPER_VERSION = "v12.2"
+SCRAPER_VERSION = "v12.3"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -801,19 +801,33 @@ def _rows_clear_table(table_id: str) -> bool:
     return False
 
 def _rows_append_values(table_id: str, values: List[List[Any]]) -> bool:
-    url = f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values:append"
+    """
+    Rows API has had multiple route shapes over time. We try known variants:
+      - .../values:append
+      - .../values/append
+    """
     payload = {"values": values}
-    for attempt in range(3):
-        resp = requests.post(url, headers=_rows_headers(), json=payload, timeout=30)
-        if resp.status_code in (200, 201):
-            return True
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get('Retry-After', 60))
-            logger.warning(f"Rows rate limited, retrying after {retry_after}s...")
-            time.sleep(retry_after)
-            continue
-        logger.error(f"Rows append failed: {resp.status_code} - {resp.text}")
-        return False
+    candidates = [
+        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values:append",
+        f"https://api.rows.com/v1/spreadsheets/{ROWS_SPREADSHEET_ID}/tables/{table_id}/values/append",
+    ]
+
+    for url in candidates:
+        for attempt in range(3):
+            resp = requests.post(url, headers=_rows_headers(), json=payload, timeout=30)
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 60))
+                logger.warning(f"Rows rate limited, retrying after {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+            # If the path itself isn't recognized, try the next candidate URL.
+            if resp.status_code == 404 and "Path not found" in (resp.text or ""):
+                logger.warning(f"Rows append endpoint not found via {url}, trying alternative route...")
+                break
+            logger.error(f"Rows append failed via {url}: {resp.status_code} - {resp.text}")
+            return False
     return False
 
 def sync_to_rows(data: List[Dict], table_id: str, mode: str, mapper) -> bool:
