@@ -1,5 +1,5 @@
 """
-OTELMS Calendar Scraper v11.4 FINAL - Fixed CSS Selector for Accurate Parsing
+OTELMS Calendar Scraper v11.5 FINAL - Fixed Timeout + Lazy Loading
 ==========================================================================
 Bulletproof scraper with correct HTML structure parsing
 """
@@ -189,7 +189,7 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
     logger.info("Loading calendar page...")
     driver.get(OTELMS_CALENDAR_URL)
     
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 60)  # Increased from 20 to 60 seconds
     
     try:
         # Wait for calendar to load
@@ -200,6 +200,21 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script('return document.readyState') == 'complete'
         )
+        time.sleep(2)
+        
+        # Scroll down to trigger lazy loading
+        logger.info("Scrolling to trigger lazy loading...")
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(3)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(2)
+        
+        # Wait explicitly for calendar_item elements with resid attribute
+        logger.info("Waiting for calendar items with resid attribute...")
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'div.calendar_item[resid]'))
+        )
+        logger.info("Calendar items with resid found!")
         time.sleep(2)
         
         save_debug_artifacts(driver, 'calendar_loaded')
@@ -466,7 +481,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': 'v11.4-final',
+        "version": "v11.5-final",
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     }), 200
 
