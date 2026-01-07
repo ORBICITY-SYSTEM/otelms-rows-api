@@ -109,7 +109,7 @@ def collect_calendar_diagnostics(driver: webdriver.Chrome) -> Dict[str, Any]:
         "url": getattr(driver, "current_url", ""),
         "readyState": _safe_execute(driver, "return document.readyState", ""),
         "hasJQuery": bool(_safe_execute(driver, "return typeof window.jQuery !== 'undefined'", False)),
-        "jQueryActive": _safe_execute(driver, "return (window.jQuery && window.jQuery.active) || null", None),
+        "jQueryActive": _safe_execute(driver, "return (window.jQuery ? window.jQuery.active : null)", None),
         "calendarTdCount": _safe_execute(driver, "return document.querySelectorAll('td.calendar_td').length", 0),
         "calendarItemCount": _safe_execute(driver, "return document.querySelectorAll('div.calendar_item').length", 0),
         "calendarItemResidCount": _safe_execute(driver, "return document.querySelectorAll('div.calendar_item[resid]').length", 0),
@@ -260,7 +260,119 @@ def _kick_calendar_render(driver: webdriver.Chrome) -> None:
         """
     )
 
-def ensure_calendar_rendered(driver: webdriver.Chrome, timeout_seconds: int = 120) -> int:
+def _get_calendar_container_metrics(driver: webdriver.Chrome) -> Dict[str, int]:
+    metrics = driver.execute_script(
+        """
+        const el = document.querySelector('.calendar_container');
+        if (!el) return {present: 0, scrollHeight: 0, clientHeight: 0, scrollWidth: 0, clientWidth: 0};
+        return {
+          present: 1,
+          scrollHeight: el.scrollHeight || 0,
+          clientHeight: el.clientHeight || 0,
+          scrollWidth: el.scrollWidth || 0,
+          clientWidth: el.clientWidth || 0
+        };
+        """
+    )
+    if not isinstance(metrics, dict):
+        return {"present": 0, "scrollHeight": 0, "clientHeight": 0, "scrollWidth": 0, "clientWidth": 0}
+    return {
+        "present": int(metrics.get("present") or 0),
+        "scrollHeight": int(metrics.get("scrollHeight") or 0),
+        "clientHeight": int(metrics.get("clientHeight") or 0),
+        "scrollWidth": int(metrics.get("scrollWidth") or 0),
+        "clientWidth": int(metrics.get("clientWidth") or 0),
+    }
+
+def _scroll_calendar_container(driver: webdriver.Chrome, top: int = 0, left: int = 0) -> None:
+    driver.execute_script(
+        """
+        const el = document.querySelector('.calendar_container');
+        if (!el) return;
+        el.scrollTop = arguments[0];
+        el.scrollLeft = arguments[1];
+        el.dispatchEvent(new Event('scroll', {bubbles: true}));
+        """,
+        int(top),
+        int(left),
+    )
+
+def _collect_calendar_items_js(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
+    raw = driver.execute_script(
+        """
+        return Array.from(document.querySelectorAll('div.calendar_item[resid]')).map(el => {
+          const resid = el.getAttribute('resid');
+          const status = el.getAttribute('status') || '';
+          const element_id = el.getAttribute('id') || '';
+          const booking_nam = (el.querySelector('.calendar_booking_nam')?.textContent || '').trim();
+          const booking_info = (el.querySelector('.calendar_booking_info')?.textContent || '').trim();
+          const balance = (el.querySelector('.balance_negative span, .balance_positive span')?.textContent || '').trim();
+          const tooltip = (el.getAttribute('data-title') || '').trim();
+          return {resid, status, element_id, booking_nam, booking_info, balance, tooltip};
+        });
+        """
+    )
+    return raw if isinstance(raw, list) else []
+
+def scan_calendar_items(driver: webdriver.Chrome, max_scan_seconds: int = 25) -> List[Dict[str, Any]]:
+    """
+    Some OTELMS calendars virtualize DOM: only visible rows' bookings exist in the DOM.
+    This scans the scroll container top→bottom to accumulate all unique `resid` items.
+    """
+    start = time.time()
+    items_by_resid: Dict[str, Dict[str, Any]] = {}
+
+    metrics = _get_calendar_container_metrics(driver)
+    if metrics["present"] != 1 or metrics["clientHeight"] <= 0:
+        # No container; just collect what exists.
+        for it in _collect_calendar_items_js(driver):
+            resid = (it.get("resid") or "").strip()
+            if resid:
+                items_by_resid[resid] = it
+        return list(items_by_resid.values())
+
+    max_top = max(0, metrics["scrollHeight"] - metrics["clientHeight"])
+    step = max(200, int(metrics["clientHeight"] * 0.85))
+
+    last_new_count = 0
+    last_new_time = time.time()
+
+    # Two passes: down then up (sometimes new items render on reverse scroll).
+    for direction in (1, -1):
+        positions = range(0, max_top + 1, step) if direction == 1 else range(max_top, -1, -step)
+        for top in positions:
+            if time.time() - start > max_scan_seconds:
+                break
+            try:
+                _scroll_calendar_container(driver, top=top, left=0)
+            except Exception:
+                pass
+            time.sleep(0.35)
+
+            new_before = len(items_by_resid)
+            for it in _collect_calendar_items_js(driver):
+                resid = (it.get("resid") or "").strip()
+                if resid and resid not in items_by_resid:
+                    items_by_resid[resid] = it
+
+            new_after = len(items_by_resid)
+            if new_after > new_before:
+                last_new_count = new_after
+                last_new_time = time.time()
+
+            # If we've stopped discovering new items for a bit, we can stop early.
+            if last_new_count > 0 and (time.time() - last_new_time) > 3.5:
+                break
+
+    # Reset scroll
+    try:
+        _scroll_calendar_container(driver, top=0, left=0)
+    except Exception:
+        pass
+
+    return list(items_by_resid.values())
+
+def ensure_calendar_rendered(driver: webdriver.Chrome, calendar_url: str, timeout_seconds: int = 120) -> int:
     """
     Wait until bookings are actually rendered into the DOM.
 
@@ -289,11 +401,18 @@ def ensure_calendar_rendered(driver: webdriver.Chrome, timeout_seconds: int = 12
     except Exception:
         pass
 
-    stable_hits = 0
     last_count = -1
+    last_increase = time.time()
     start = time.time()
 
     while time.time() - start < timeout_seconds:
+        # Sometimes the app redirects back to login during/after calendar load.
+        if "login" in (driver.current_url or "").lower():
+            logger.warning("Detected redirect to login during calendar render; re-authenticating...")
+            login_to_otelms(driver)
+            driver.get(calendar_url)
+            time.sleep(0.5)
+
         # Actively trigger scroll handlers / lazy rendering during the wait.
         try:
             _kick_calendar_render(driver)
@@ -301,18 +420,17 @@ def ensure_calendar_rendered(driver: webdriver.Chrome, timeout_seconds: int = 12
             pass
 
         count = _safe_execute(driver, "return document.querySelectorAll('div.calendar_item[resid]').length", 0)
-        ajax_active = _safe_execute(driver, "return (window.jQuery && window.jQuery.active) || 0", 0)
+        ajax_active = _safe_execute(driver, "return (window.jQuery ? window.jQuery.active : 0)", 0)
 
-        # We want "some bookings" and "count not changing" for a couple cycles.
+        # We want "some bookings" and "count stopped increasing" for a short window.
         if isinstance(count, int) and count > 0:
-            if count == last_count:
-                stable_hits += 1
-            else:
-                stable_hits = 0
-            last_count = count
+            now = time.time()
+            if count > last_count:
+                last_increase = now
+                last_count = count
             # If jQuery is present but background XHR keeps happening, don't block forever.
-            if stable_hits >= 2 and (ajax_active == 0 or (time.time() - start) > 10):
-                return count
+            if (now - last_increase) >= 8 and (ajax_active == 0 or (now - start) > 10):
+                return last_count
 
         time.sleep(1.5)
 
@@ -333,7 +451,7 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
         # Wait for actual rendered bookings (not just page load).
         render_timeout = int(os.environ.get("CALENDAR_RENDER_TIMEOUT", "120"))
         logger.info(f"Waiting for calendar bookings to render (timeout={render_timeout}s)...")
-        rendered_count = ensure_calendar_rendered(driver, timeout_seconds=render_timeout)
+        rendered_count = ensure_calendar_rendered(driver, OTELMS_CALENDAR_URL, timeout_seconds=render_timeout)
         logger.info(f"Calendar bookings rendered: {rendered_count} elements with resid")
 
         save_debug_artifacts(driver, 'calendar_rendered', extra=collect_calendar_diagnostics(driver))
@@ -342,22 +460,9 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
         data_rows = []
         seen_bookings = set()
 
-        # Extract via JS to avoid stale element reference issues.
-        raw_items = driver.execute_script(
-            """
-            return Array.from(document.querySelectorAll('div.calendar_item[resid]')).map(el => {
-              const resid = el.getAttribute('resid');
-              const status = el.getAttribute('status') || '';
-              const element_id = el.getAttribute('id') || '';
-              const booking_nam = (el.querySelector('.calendar_booking_nam')?.textContent || '').trim();
-              const booking_info = (el.querySelector('.calendar_booking_info')?.textContent || '').trim();
-              const balance = (el.querySelector('.balance_negative span, .balance_positive span')?.textContent || '').trim();
-              return {resid, status, element_id, booking_nam, booking_info, balance};
-            });
-            """
-        ) or []
-
-        logger.info(f"Found {len(raw_items)} booking blocks (JS extraction)")
+        # Scan (scroll) + extract via JS to avoid stale element reference issues and DOM virtualization.
+        raw_items = scan_calendar_items(driver, max_scan_seconds=25)
+        logger.info(f"Found {len(raw_items)} booking blocks (scan + JS extraction)")
 
         for item in raw_items:
             try:
@@ -371,6 +476,7 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
                 booking_nam = (item.get("booking_nam") or "").strip()
                 booking_info = (item.get("booking_info") or "").strip().rstrip(",")
                 balance = (item.get("balance") or "").strip()
+                tooltip = (item.get("tooltip") or "").strip()
 
                 booking_id = None
                 guest_name = None
@@ -382,19 +488,18 @@ def extract_calendar_data(driver: webdriver.Chrome) -> List[Dict]:
                         booking_id = parts[0].strip()
                         guest_name = parts[1].strip()
 
-                if booking_id or guest_name:
-                    data_rows.append({
-                        "resid": resid,
-                        "booking_id": booking_id or resid,  # Fallback to resid
-                        "guest_name": guest_name or "",
-                        "source": booking_info,
-                        "balance": balance,
-                        "status": status,
-                        "element_id": element_id,
-                        "extracted_at": datetime.utcnow().isoformat() + "Z",
-                    })
-                else:
-                    logger.warning(f"Skipping resid {resid}: no booking_id or guest_name found")
+                # Keep the record even if name parsing fails; resid is still a booking identifier.
+                data_rows.append({
+                    "resid": resid,
+                    "booking_id": booking_id or resid,  # Fallback to resid
+                    "guest_name": guest_name or "",
+                    "source": booking_info,
+                    "balance": balance,
+                    "status": status,
+                    "element_id": element_id,
+                    "tooltip": tooltip,
+                    "extracted_at": datetime.utcnow().isoformat() + "Z",
+                })
             except Exception as e:
                 logger.error(f"Error parsing booking item: {e}")
                 continue
