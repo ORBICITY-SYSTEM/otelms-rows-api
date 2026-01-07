@@ -1052,6 +1052,28 @@ def _set_rlist_sort(driver: webdriver.Chrome, sort_mode: str) -> None:
         sort_text,
     )
 
+def _set_rlist_status(driver: webdriver.Chrome, status_text: str = "ყველა") -> bool:
+    """
+    Ensure rlist "სტატუსი" filter is set to "ყველა" (All), unless overridden.
+    We select by visible text on any <select>.
+    """
+    status_text = (status_text or "").strip() or "ყველა"
+    return bool(driver.execute_script(
+        """
+        const target = arguments[0];
+        const selects = Array.from(document.querySelectorAll('select'));
+        for (const sel of selects) {
+          const opt = Array.from(sel.options || []).find(o => (o.textContent||'').trim() === target);
+          if (!opt) continue;
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        }
+        return false;
+        """,
+        status_text,
+    ))
+
 def _set_rlist_categories(driver: webdriver.Chrome, category_names: List[str]) -> bool:
     """
     Enforce that only the provided categories are selected in the rlist "კატეგორია" multi-select.
@@ -1142,6 +1164,7 @@ def extract_rlist_data(driver: webdriver.Chrome, start_date: str, end_date: str,
     _set_rlist_date_range(driver, start_date=start_date, end_date=end_date)
     active_categories = _env_str_list("RLIST_ACTIVE_CATEGORIES", DEFAULT_RLIST_ACTIVE_CATEGORIES)
     _set_rlist_categories(driver, active_categories)
+    _set_rlist_status(driver, _env_str_list("RLIST_STATUS", ["ყველა"])[0])
     _set_rlist_sort(driver, sort_mode=sort_mode)
     _click_rlist_search(driver)
 
